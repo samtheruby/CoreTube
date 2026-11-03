@@ -111,7 +111,6 @@ struct _GstAmlVideoSink {
   GstBuffer *prerolled; /* sent to the decoder at preroll; render skips it */
   gint64 next_stats; /* monotonic time of the next pacing log */
   gchar *config;    /* decoder config string; codec.config points here while open */
-  gint saved_blackout; /* blackout_policy before the decoder opened; -1 when not changed */
   GstPadChainFunction base_chain; /* GstBaseSink's, for frames inside the segment */
 
   /* Screen mute while a decoder (re)starts; guarded by hold_lock. */
@@ -395,19 +394,11 @@ static const AmlPresenterOps amlvideo_ops = {amlvideo_poll_vsync, amlvideo_deque
 /* The host test swaps in a fake amlvideo. */
 static const AmlPresenterOps *presenter_ops = &amlvideo_ops;
 
-static void restore_blackout(GstAmlVideoSink *self)
-{
-  gchar value[16];
-
-  if (self->saved_blackout < 0)
-    return;
-  g_snprintf(value, sizeof(value), "%d", self->saved_blackout);
-  write_sysfs(SYSFS_BLACKOUT_POLICY, value);
-  self->saved_blackout = -1;
-}
-
 static void close_decoder(GstAmlVideoSink *self)
 {
+  gint blackout;
+  gchar value[16];
+
   g_clear_pointer(&self->config, g_free);
   gst_buffer_replace(&self->prerolled, NULL);
   if (!self->open)
@@ -415,6 +406,14 @@ static void close_decoder(GstAmlVideoSink *self)
   release_hold(self, NULL);
   /* First: the decoder must get every frame the presenter holds back before it closes. */
   g_clear_pointer(&self->presenter, aml_presenter_free);
+  /* As Kodi closes (CAMLCodec::CloseDecoder): with blackout_policy 0 the kernel keeps
+   * the last frame on the video layer, and turns that layer back on even after
+   * disable_video=1; an HDR frame left there keeps the TV in HDR under Kodi. While
+   * playing it stays as the system has it, so a seek's decoder reset keeps the last
+   * frame on screen (and the TV in HDR). */
+  blackout = read_sysfs_int(SYSFS_BLACKOUT_POLICY);
+  if (blackout >= 0)
+    write_sysfs(SYSFS_BLACKOUT_POLICY, "1");
   amcodec.close(&self->codec);
   close(self->video_fd);
   self->video_fd = -1;
@@ -424,7 +423,10 @@ static void close_decoder(GstAmlVideoSink *self)
   write_sysfs(SYSFS_FREERUN_MODE, "0");
   write_sysfs(SYSFS_DISABLE_VIDEO, "1");
   /* After the close: blackout_policy 1 made the kernel drop the last frame there. */
-  restore_blackout(self);
+  if (blackout >= 0) {
+    g_snprintf(value, sizeof(value), "%d", blackout);
+    write_sysfs(SYSFS_BLACKOUT_POLICY, value);
+  }
 }
 
 /* The decoder's config string, as Kodi's CAMLCodec::GetHDRStaticMetadata builds it:
@@ -515,18 +517,10 @@ static gboolean open_decoder(GstAmlVideoSink *self, GstCaps *caps)
         ("cannot open %s: %s", AMLVIDEO_DEVICE, g_strerror(errno)));
     return FALSE;
   }
-  /* As Kodi plays: with blackout_policy 0 the kernel keeps the last frame on the
-   * video layer when the decoder closes, and turns that layer back on even after
-   * disable_video=1; an HDR frame left there keeps the TV in HDR under Kodi. */
-  self->saved_blackout = read_sysfs_int(SYSFS_BLACKOUT_POLICY);
-  if (self->saved_blackout >= 0)
-    write_sysfs(SYSFS_BLACKOUT_POLICY, "1");
-
   ret = amcodec.init(&self->codec);
   if (ret != 0) {
     close(self->video_fd);
     self->video_fd = -1;
-    restore_blackout(self);
     GST_ELEMENT_ERROR(self, RESOURCE, OPEN_WRITE, ("Cannot open the hardware video decoder."),
         ("codec_init failed: %d", ret));
     return FALSE;
@@ -947,7 +941,6 @@ static void gst_aml_video_sink_init(GstAmlVideoSink *self)
 {
   GstBaseSink *bsink = GST_BASE_SINK(self);
 
-  self->saved_blackout = -1;
   self->video_fd = -1;
   g_mutex_init(&self->hold_lock);
 

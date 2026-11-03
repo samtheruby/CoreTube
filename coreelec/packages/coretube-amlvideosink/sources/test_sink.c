@@ -16,6 +16,17 @@ static guint64 checkins[4]; /* timestamps queued since the test cleared checkin_
 static guint checkin_count;
 static int fake_init(codec_para_t *c) { init_video_path = c->video_path; return init_result; }
 static int fake_ok(codec_para_t *c) { (void)c; return 0; }
+static gchar blackout_at_close[8]; /* blackout_policy when the decoder last closed */
+static int fake_close(codec_para_t *c)
+{
+  gchar *got = NULL;
+
+  (void)c;
+  g_file_get_contents(SYSFS_ROOT "/sys/class/video/blackout_policy", &got, NULL, NULL);
+  g_strlcpy(blackout_at_close, got ? g_strstrip(got) : "", sizeof(blackout_at_close));
+  g_free(got);
+  return 0;
+}
 static int fake_checkin(codec_para_t *c, guint64 pts)
 {
   (void)c;
@@ -126,11 +137,13 @@ static void test_decoder_sysfs(void)
   sink = g_object_new(GST_TYPE_AML_VIDEO_SINK, NULL);
   gst_segment_init(&GST_BASE_SINK(sink)->segment, GST_FORMAT_TIME);
 
-  /* Fullscreen video: the kernel must not keep the last frame, and the screen is
-   * muted until the first decoded frame is shown. */
+  /* Fullscreen video: the screen is muted until the first decoded frame is shown.
+   * While playing, the kernel keeps the last frame on screen (blackout_policy as the
+   * system has it, 0): a seek resets the decoder, and an empty video layer would
+   * drop the TV out of HDR. */
   g_object_set(sink, "rectangle", "0,0,1920,1080", NULL);
   assert(open_decoder(sink, h264));
-  assert(is(BLACKOUT, "1") && is(MUTE, "1") && is(DISABLE, "2"));
+  assert(is(BLACKOUT, "0") && is(MUTE, "1") && is(DISABLE, "2"));
   render_at(sink, GST_SECOND);
   g_usleep(50 * 1000);
   assert(is(MUTE, "1"));                  /* nothing decoded yet */
@@ -139,25 +152,27 @@ static void test_decoder_sysfs(void)
 
   /* A seek mutes again until a frame decoded after it shows. */
   gst_aml_video_sink_event(GST_BASE_SINK(sink), gst_event_new_flush_stop(TRUE));
-  assert(is(MUTE, "1"));
+  assert(is(MUTE, "1") && is(BLACKOUT, "0"));
   render_at(sink, GST_SECOND);
   g_usleep(50 * 1000);
   assert(is(MUTE, "1"));
   g_usleep(400 * 1000);                   /* the timeout unmutes */
   assert(is(MUTE, "0"));
 
-  /* Closing restores blackout_policy and leaves the screen unmuted. */
+  /* As Kodi closes: blackout_policy 1 while the decoder closes, so no frame (an HDR
+   * one would keep the TV in HDR) stays behind; then restored, screen unmuted. */
   gst_aml_video_sink_event(GST_BASE_SINK(sink), gst_event_new_flush_stop(TRUE));
   assert(is(MUTE, "1"));
   close_decoder(sink);
+  assert(strcmp(blackout_at_close, "1") == 0);
   assert(is(BLACKOUT, "0") && is(MUTE, "0") && is(DISABLE, "1"));
 
   /* A video in a window (home screen preview) never mutes the screen. */
   g_object_set(sink, "rectangle", "100,100,640,360", NULL);
   assert(open_decoder(sink, h264));
-  assert(is(BLACKOUT, "1") && is(MUTE, "0"));
+  assert(is(BLACKOUT, "0") && is(MUTE, "0"));
   close_decoder(sink);
-  assert(is(BLACKOUT, "0"));
+  assert(strcmp(blackout_at_close, "1") == 0 && is(BLACKOUT, "0"));
 
   /* A decoder that fails to open leaves blackout_policy as it was. */
   init_result = -1;
@@ -873,7 +888,8 @@ int main(void)
   assert(strcmp(c, "HDRStaticInfo:1;mR.x:35400;mR.y:14600;mG.x:8500;mG.y:39850;mB.x:6550;mB.y:2300;"
                    "mW.x:15635;mW.y:16450;mMaxDL:10000000;mMinDL:50;mCLLPresent:1;mMaxCLL:1000;mMaxFALL:400;mTransfer:16") == 0);
   amcodec.init = fake_init;
-  amcodec.close = amcodec.reset = amcodec.pause = fake_ok;
+  amcodec.reset = amcodec.pause = fake_ok;
+  amcodec.close = fake_close;
   amcodec.checkin_pts_us64 = fake_checkin;
   amcodec.set_eos = fake_set_int;
   presenter_ops = &sink_video_ops;
