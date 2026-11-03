@@ -1,0 +1,130 @@
+alsasink: make IEC 61937 passthrough work (AC3, E-AC3, DTS)
+
+Three upstream bugs kept alsasink from passing a bitstream through:
+- getcaps probes the IEC958 PCM by opening it while the sink's own handle
+  holds the same hardware, gets EBUSY, and offers PCM only, so playbin
+  decodes. EBUSY means the PCM resolved to that hardware: offer passthrough.
+- prepare picked the device from iec958 before parse_spec had set it, so the
+  first passthrough stream stayed on the plain PCM device.
+- The device was opened with the caps' channel count (6 for 5.1) and rate,
+  but IEC 61937 is 2-channel 16-bit PCM, and E-AC3 bursts take 4 times the
+  audio rate (the ring buffer counts 16 bytes per frame for it). Open it as
+  2 channels at rate * bytes-per-frame / 4 (192 kHz for E-AC3), count ALSA
+  frames as 4 bytes, and put that rate in the IEC958 channel status, as
+  Kodi does.
+Upstream reports: bugzilla 721740, 757258; gst-plugins-base issue 513.
+
+--- a/ext/alsa/gstalsa.c
++++ b/ext/alsa/gstalsa.c
+@@ -20,6 +20,8 @@
+ #include <gst/audio/audio.h>
+ #include <gst/audio/gstdsd.h>
+ 
++#include <errno.h>
++
+ static GstCaps *
+ gst_alsa_detect_rates (GstObject * obj, snd_pcm_hw_params_t * hw_params,
+     GstCaps * in_caps)
+@@ -648,7 +650,7 @@ max_chan_error:
+ }
+ 
+ snd_pcm_t *
+-gst_alsa_open_iec958_pcm (GstObject * obj, gchar * device)
++gst_alsa_open_iec958_pcm (GstObject * obj, gchar * device, guint rate)
+ {
+   char *iec958_pcm_name = NULL;
+   snd_pcm_t *pcm = NULL;
+@@ -671,7 +673,8 @@ gst_alsa_open_iec958_pcm (GstObject * obj, gchar * device)
+       device,
+       IEC958_AES0_CON_EMPHASIS_NONE | IEC958_AES0_NONAUDIO,
+       IEC958_AES1_CON_ORIGINAL | IEC958_AES1_CON_PCM_CODER,
+-      0, IEC958_AES3_CON_FS_48000);
++      0, rate == 192000 ? IEC958_AES3_CON_FS_192000 :
++      IEC958_AES3_CON_FS_48000);
+ 
+   GST_DEBUG_OBJECT (obj, "Generated device string \"%s\"", devstr);
+   iec958_pcm_name = devstr;
+@@ -681,6 +684,7 @@ gst_alsa_open_iec958_pcm (GstObject * obj, gchar * device)
+     GST_DEBUG_OBJECT (obj, "failed opening IEC958 device: %s",
+         snd_strerror (res));
+     pcm = NULL;
++    errno = -res;
+   }
+ 
+   return pcm;
+@@ -764,11 +768,15 @@ gst_alsa_probe_supported_formats (GstObject * obj, gchar * device,
+   /* Try opening IEC958 device to see if we can support that format (playback
+    * only for now but we could add SPDIF capture later) */
+   if (stream_type == SND_PCM_STREAM_PLAYBACK) {
+-    snd_pcm_t *pcm = gst_alsa_open_iec958_pcm (obj, device);
++    snd_pcm_t *pcm = gst_alsa_open_iec958_pcm (obj, device, 48000);
+ 
+     if (G_LIKELY (pcm)) {
+       gst_caps_append (caps, gst_caps_from_string (PASSTHROUGH_CAPS));
+       snd_pcm_close (pcm);
++    } else if (errno == EBUSY) {
++      /* The IEC958 PCM resolved to the hardware the sink already holds open
++       * (its own handle), so the device takes IEC 61937 too. */
++      gst_caps_append (caps, gst_caps_from_string (PASSTHROUGH_CAPS));
+     }
+   }
+ 
+--- a/ext/alsa/gstalsa.h
++++ b/ext/alsa/gstalsa.h
+@@ -51,7 +51,7 @@
+ GST_DEBUG_CATEGORY_EXTERN (alsa_debug);
+ #define GST_CAT_DEFAULT alsa_debug
+ 
+-snd_pcm_t * gst_alsa_open_iec958_pcm (GstObject * obj, gchar *device);
++snd_pcm_t * gst_alsa_open_iec958_pcm (GstObject * obj, gchar *device, guint rate);
+ 
+ GstCaps * gst_alsa_probe_supported_formats (GstObject      * obj,
+                                             gchar          * device,
+--- a/ext/alsa/gstalsasink.c
++++ b/ext/alsa/gstalsasink.c
+@@ -884,6 +884,14 @@ alsasink_parse_spec (GstAlsaSink * alsa, GstAudioRingBufferSpec * spec)
+   }
+   alsa->rate = GST_AUDIO_INFO_RATE (&spec->info);
+   alsa->channels = GST_AUDIO_INFO_CHANNELS (&spec->info);
++  if (alsa->iec958) {
++    /* IEC 61937 is 2-channel 16-bit PCM (4 bytes a frame); the ring buffer's
++     * bytes per frame give the burst rate: 4 for AC3/DTS (same rate), 16 for
++     * E-AC3 (4 times, 192 kHz). */
++    alsa->rate = GST_AUDIO_INFO_RATE (&spec->info) *
++        GST_AUDIO_INFO_BPF (&spec->info) / 4;
++    alsa->channels = 2;
++  }
+   alsa->buffer_time = spec->buffer_time;
+   alsa->period_time = spec->latency_time;
+   alsa->access = SND_PCM_ACCESS_RW_INTERLEAVED;
+@@ -945,21 +953,25 @@ gst_alsasink_prepare (GstAudioSink * asink, GstAudioRingBufferSpec * spec)
+ 
+   alsa = GST_ALSA_SINK (asink);
+ 
++  /* Parse first: it sets iec958, which picks the device below. */
++  if (!alsasink_parse_spec (alsa, spec))
++    goto spec_parse;
++
+   if (alsa->iec958) {
+     snd_pcm_close (alsa->handle);
+-    alsa->handle = gst_alsa_open_iec958_pcm (GST_OBJECT (alsa), alsa->device);
++    alsa->handle = gst_alsa_open_iec958_pcm (GST_OBJECT (alsa), alsa->device,
++        GST_AUDIO_INFO_RATE (&spec->info) *
++        GST_AUDIO_INFO_BPF (&spec->info) / 4);
+     if (G_UNLIKELY (!alsa->handle)) {
+       goto no_iec958;
+     }
+   }
+ 
+-  if (!alsasink_parse_spec (alsa, spec))
+-    goto spec_parse;
+-
+   CHECK (set_hwparams (alsa), hw_params_failed);
+   CHECK (set_swparams (alsa), sw_params_failed);
+ 
+-  alsa->bpf = GST_AUDIO_INFO_BPF (&spec->info);
++  /* ALSA frames: 4 bytes for IEC 61937 whatever the ring buffer counts. */
++  alsa->bpf = alsa->iec958 ? 4 : GST_AUDIO_INFO_BPF (&spec->info);
+   spec->segsize = alsa->period_size * alsa->bpf;
+   spec->segtotal = alsa->buffer_size / alsa->period_size;
+ 

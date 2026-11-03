@@ -1,0 +1,16 @@
+--- a/ext/alsa/gstalsasink.c
++++ b/ext/alsa/gstalsasink.c
+@@ -587,8 +587,11 @@
+   GST_DEBUG_OBJECT (alsa, "buffer size %lu, period size %lu", alsa->buffer_size,
+       alsa->period_size);
+ 
+-  /* Check if hardware supports pause */
+-  alsa->hw_support_pause = snd_pcm_hw_params_can_pause (params);
++  /* Check if hardware supports pause. Some drivers (Amlogic AUGE before its
++   * resume fix) report pause but never start again after PAUSE_RELEASE; with
++   * GST_ALSASINK_NO_HW_PAUSE set, stop and restart the device instead. */
++  alsa->hw_support_pause = snd_pcm_hw_params_can_pause (params) &&
++      !g_getenv ("GST_ALSASINK_NO_HW_PAUSE");
+   GST_DEBUG_OBJECT (alsa, "Hw support pause: %s",
+       alsa->hw_support_pause ? "yes" : "no");
+ 
