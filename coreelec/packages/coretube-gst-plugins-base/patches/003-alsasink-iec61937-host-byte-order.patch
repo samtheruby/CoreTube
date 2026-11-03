@@ -1,0 +1,41 @@
+alsasink: send IEC 61937 bursts in host byte order
+
+gst_alsasink_payload() calls gst_audio_iec61937_payload() with G_BIG_ENDIAN,
+which writes the burst header and the payload as 16-bit words in host byte
+order. alsasink then asked ALSA for S16_BE and, on little-endian hardware,
+fell back to S16_LE "with swapping", turning every word around: the receiver
+sees an E-AC3/AC3 signal it cannot sync to and stays silent (or plays noise
+when the output is flagged as PCM). Open the device in host byte order and
+swap only when it takes the other one alone.
+Upstream report: bugzilla 757258 (gst-plugins-base issue 238).
+
+--- a/ext/alsa/gstalsasink.c
++++ b/ext/alsa/gstalsasink.c
+@@ -459,11 +459,13 @@
+       wrong_access);
+   /* set the sample format */
+   if (alsa->iec958) {
+-    /* Try to use big endian first else fallback to le and swap bytes */
++    /* Payloaded bursts come in host byte order: use it, else the other byte
++     * order with swapping */
+     if (snd_pcm_hw_params_set_format (alsa->handle, params, alsa->format) < 0) {
+-      alsa->format = SND_PCM_FORMAT_S16_LE;
++      alsa->format = alsa->format == SND_PCM_FORMAT_S16_LE ?
++          SND_PCM_FORMAT_S16_BE : SND_PCM_FORMAT_S16_LE;
+       alsa->need_swap = TRUE;
+-      GST_DEBUG_OBJECT (alsa, "falling back to little endian with swapping");
++      GST_DEBUG_OBJECT (alsa, "falling back to the other byte order with swapping");
+     } else {
+       alsa->need_swap = FALSE;
+     }
+@@ -876,7 +878,9 @@
+     case GST_AUDIO_RING_BUFFER_FORMAT_TYPE_EAC3:
+     case GST_AUDIO_RING_BUFFER_FORMAT_TYPE_DTS:
+     case GST_AUDIO_RING_BUFFER_FORMAT_TYPE_MPEG:
+-      alsa->format = SND_PCM_FORMAT_S16_BE;
++      /* Called with G_BIG_ENDIAN (gst_alsasink_payload), gst_audio_iec61937_payload()
++       * writes header and payload as 16-bit words in host byte order */
++      alsa->format = SND_PCM_FORMAT_S16;
+       alsa->iec958 = TRUE;
+       break;
+     default:
