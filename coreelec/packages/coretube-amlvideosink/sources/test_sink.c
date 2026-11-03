@@ -493,6 +493,7 @@ typedef struct {
   gboolean in_poll;     /* the presenter waits in poll */
   guint polls, bad_timeouts;
   gint64 now, base;     /* fake clock; running time = now - base while the clock runs */
+  gint64 jitter;        /* the running time reads this much late, then early, in turn */
   gboolean clock_running;
   struct { guint index; guint64 pts; } decoded[512];
   guint n_decoded, next_decoded;
@@ -560,7 +561,7 @@ static gint64 fake_running_us(void *ctx)
   gint64 running;
 
   g_mutex_lock(&f->lock);
-  running = f->clock_running ? f->now - f->base : -1;
+  running = f->clock_running ? f->now - f->base + (f->polls & 1 ? f->jitter : -f->jitter) : -1;
   g_mutex_unlock(&f->lock);
   return running;
 }
@@ -656,6 +657,50 @@ static void test_presents_in_order(void)
   assert(f->n_log == 10);
   for (guint i = 0; i < 10; i++)
     assert(f->log[i].index == i && !f->log[i].drop);
+  fake_video_free(f);
+}
+
+/* As Kodi's clock: the pipeline clock (the audio sink's position) jitters by
+ * ±12 ms; 60 fps on 60 Hz, each frame 0.2 vsync from the boundary between two
+ * vsyncs, still shows every frame once, none dropped or repeated. */
+static void test_jittery_clock_keeps_cadence(void)
+{
+  FakeVideo *f = fake_video_new();
+  guint64 shown0, repeated0, dropped0, shown, repeated, dropped;
+
+  f->jitter = 12000;
+  for (guint i = 0; i < 120; i++)
+    decoded(f, i, 5000 + i * 16667 + 1);
+  play(f, 0);
+  aml_presenter_start(f->presenter);
+  tick(f, 20, TRUE);
+  aml_presenter_get_stats(f->presenter, &shown0, &repeated0, &dropped0);
+  tick(f, 80, TRUE);
+  aml_presenter_get_stats(f->presenter, &shown, &repeated, &dropped);
+  if (shown - shown0 != 80 || repeated != repeated0 || dropped != dropped0)
+    g_printerr("80 vsyncs: shown %" G_GUINT64_FORMAT ", repeated %" G_GUINT64_FORMAT ", dropped %" G_GUINT64_FORMAT "\n",
+        shown - shown0, repeated - repeated0, dropped - dropped0);
+  assert(shown - shown0 == 80 && repeated == repeated0 && dropped == dropped0);
+  fake_video_free(f);
+}
+
+/* A real jump of the pipeline clock (resume, an audio clock catching up) is
+ * followed at once, not smoothed over seconds. */
+static void test_clock_jump_followed(void)
+{
+  FakeVideo *f = fake_video_new();
+
+  for (guint i = 0; i < 40; i++)
+    decoded(f, i, i * 16667 + 1);
+  play(f, 0);
+  aml_presenter_start(f->presenter);
+  tick(f, 5, TRUE);
+  play(f, 500000);                          /* the clock is now 0.5 s further on */
+  tick(f, 2, TRUE);
+  /* The second vsync after the jump reads 533334 us: frames up to 1.5 vsync later
+   * (frame 33) are due and it shows; those left behind dropped. */
+  assert(count_queued(f, 10, TRUE) == 1);
+  assert(count_queued(f, 33, FALSE) == 1);
   fake_video_free(f);
 }
 
@@ -908,6 +953,8 @@ int main(void)
   test_double_speed_shows_each_frame_once();
   test_vsync_median();
   test_presents_in_order();
+  test_jittery_clock_keeps_cadence();
+  test_clock_jump_followed();
   test_paused_shows_first_frame_once();
   test_flush_returns_every_buffer();
   test_stall_keeps_last_frame();

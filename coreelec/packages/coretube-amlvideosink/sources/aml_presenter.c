@@ -10,6 +10,10 @@ GST_DEBUG_CATEGORY_STATIC(aml_presenter_debug);
 
 /* Longest wait for a vsync; it also bounds how long a flush waits for the thread. */
 #define POLL_TIMEOUT_MS 50
+/* The presenter's clock takes 1/CLOCK_GAIN of its error to the pipeline clock each
+ * vsync, and an error of CLOCK_RESYNC_US or more at once. */
+#define CLOCK_GAIN 16
+#define CLOCK_RESYNC_US 100000
 
 typedef struct {
   guint index;
@@ -36,6 +40,8 @@ struct AmlPresenter {
   gint64 intervals[AML_PACER_VSYNC_SAMPLES];
   guint n_intervals;
   gint64 last_vsync;
+  gint64 clock; /* running time at the last vsync, as follow_clock keeps it */
+  gboolean clock_valid;
   guint64 shown, repeated, dropped; /* since new */
   void (*shown_callback)(gpointer);
   gpointer shown_data;
@@ -140,13 +146,35 @@ static void record_vsync(AmlPresenter *p, gboolean vsync, gint64 now)
   p->last_vsync = now;
 }
 
+/* Running time at this vsync, |interval| us after the last one (0: none just before).
+ * As Kodi's clock: it steps one vsync period per vsync and follows the pipeline clock
+ * slowly, so that clock's jitter (the audio sink's position moves in steps) never
+ * moves a frame to another vsync; a jump (resume, a clock catching up) is taken at
+ * once. Paused, or without a clock, it is the pipeline clock. */
+static gint64 follow_clock(AmlPresenter *p, gint64 interval, gint64 running)
+{
+  if (running >= 0 && interval > 0 && p->playing && p->clock_valid) {
+    gint64 period = aml_pacer_vsync_us(p->intervals, p->n_intervals), error;
+
+    p->clock += MAX(1, (interval + period / 2) / period) * period;
+    error = running - p->clock;
+    if (ABS(error) < CLOCK_RESYNC_US) {
+      p->clock += error / CLOCK_GAIN;
+      return p->clock;
+    }
+  }
+  p->clock = running;
+  p->clock_valid = running >= 0 && p->playing;
+  return running;
+}
+
 static gpointer run(gpointer data)
 {
   AmlPresenter *p = data;
 
   while (!g_atomic_int_get(&p->stopping)) {
     int ret = p->ops->poll_vsync(p->ctx, POLL_TIMEOUT_MS);
-    gint64 now = p->ops->now_us(p->ctx), running = p->ops->running_us(p->ctx);
+    gint64 now = p->ops->now_us(p->ctx), running = p->ops->running_us(p->ctx), interval;
     gboolean first;
     guint index;
     guint64 pts;
@@ -159,7 +187,9 @@ static gpointer run(gpointer data)
     }
 
     g_mutex_lock(&p->lock);
+    interval = ret > 0 && p->last_vsync ? now - p->last_vsync : 0;
     record_vsync(p, ret > 0, now);
+    running = follow_clock(p, interval, running);
     while (p->n_held < AML_PACER_MAX_FRAMES && p->ops->dequeue(p->ctx, &index, &pts) == 0)
       p->held[p->n_held++] = (HeldFrame){index, pts, frame_running_us(p, pts)};
     first = present(p, ret > 0, running);
@@ -204,6 +234,7 @@ void aml_presenter_start(AmlPresenter *p)
   p->shown_since_start = FALSE;
   p->last_stream = GST_CLOCK_TIME_NONE;
   p->last_vsync = 0;
+  p->clock_valid = FALSE;
   g_mutex_unlock(&p->lock);
   g_atomic_int_set(&p->stopping, 0);
   p->thread = g_thread_new("amlpresenter", run, p);
