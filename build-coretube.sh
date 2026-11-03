@@ -143,6 +143,13 @@ owner() {
 in_docker() {
   local step=$1 user
   user=$(owner "$image" "$step")
+  if [ "$step" = packages ] && [ "${user%%:*}" = 0 ]; then
+    # A root-owned build folder (made by root on a NAS, say): give CoreELEC's own
+    # folder, if it does not exist yet, to the images' build user (uid 1000).
+    docker run --rm --user 0 -v "$(map_path "$build_dir")":/d "$image" \
+      sh -c '[ -e "/d/$1" ] || { mkdir -p "/d/$1" && chown 1000:1000 "/d/$1"; }' _ "$ce_subdir"
+    user=$(owner "$image" "$step")
+  fi
   [ "$step" != packages ] || [ "${user%%:*}" != 0 ] ||
     die "$ce_build (or $build_dir) belongs to root; CoreELEC refuses to build as root (chown it to your user)"
   local -a extra=()

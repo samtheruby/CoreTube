@@ -14,7 +14,7 @@ Videos play on the box's own video hardware. Protected videos use the official W
 - A Linux PC (x86-64) with Docker.
 - A lot of disk space: the Cobalt source is about 25 GB, and a CoreELEC build folder is tens of GB.
 - Two folders the build can reuse or fill:
-  - a CoreELEC build folder (`--build-dir`), owned by a normal user, not root;
+  - a CoreELEC build folder (`--build-dir`). A new one may belong to root: the build then creates CoreELEC's folder inside it for the build user (uid 1000). A folder CoreELEC has already built in must not belong to root;
   - a Cobalt folder (`--cobalt-dir`) for the Cobalt source and its tools.
 
 A first build into empty folders takes several hours. Later builds reuse what is already built. Create the folders first if they do not exist yet.
