@@ -1,0 +1,262 @@
+From 9defc27b9aa59a7200abfad80f5ae7c4885a2449 Mon Sep 17 00:00:00 2001
+From: samtheruby <peasea1012@gmail.com>
+Date: Tue, 3 Nov 2026 22:13:20 +0000
+Subject: [PATCH 1/2] fix(coreelec): keep the refresh rate while a video fills
+ the screen
+
+YouTube makes the player again for the same video (e.g. right after it
+starts). The old player's end scheduled the return to the normal refresh
+rate, and nothing cancelled it, since TizenTube asks for a rate only when
+playback starts: five seconds later the TV went back to 60 Hz mid-video.
+Count the full-screen videos (from each player's bounds): while one shows,
+the display keeps its rate, and the return is due five seconds after the
+last one goes. Home screen previews are windows and do not count.
+---
+ .../coreelec/tests/coreelec_display_test.cc   | 32 ++++++++++++++
+ .../starboard/rdk/shared/application_rdk.cc   |  6 ++-
+ .../starboard/rdk/shared/coreelec_display.cc  | 42 ++++++++++++++++++-
+ .../starboard/rdk/shared/coreelec_display.h   | 22 +++++++++-
+ .../rdk/shared/player/player_internal.cc      | 15 +++++++
+ 5 files changed, 114 insertions(+), 3 deletions(-)
+
+diff --git a/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/tests/coreelec_display_test.cc b/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/tests/coreelec_display_test.cc
+index 264cf2beaa9..ccb356dc186 100644
+--- a/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/tests/coreelec_display_test.cc
++++ b/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/tests/coreelec_display_test.cc
+@@ -94,6 +94,38 @@ int main() {
+   afr.Choose(modes, "1080p24hz", false, caps, 0, t0);
+   assert(!afr.Restore("1080p60hz", false, t0 + delay));
+ 
++  // A full-screen video keeps its rate. YouTube makes the player again for the same
++  // video; the old one going must not take the display back while the new one shows.
++  AutoFrameRate watch;
++  watch.SetVideosOnScreen(1, t0);
++  s = watch.Choose(modes, "1080p60hz", false, caps, 24, t0);
++  assert(s && s->name == "1080p24hz");
++  watch.Choose(modes, "1080p24hz", false, caps, 0, t0 + 1s);       // old player gone
++  watch.SetVideosOnScreen(0, t0 + 1s);
++  assert(watch.restore_time() == t0 + 1s + delay);
++  watch.SetVideosOnScreen(1, t0 + 2s);                              // the new one
++  assert(!watch.restore_time());
++  assert(!watch.Restore("1080p24hz", false, t0 + 2s + 2 * delay));
++  // No rate wanted while a video still shows: nothing until it goes.
++  assert(!watch.Choose(modes, "1080p24hz", false, caps, 0, t0 + 20s));
++  assert(!watch.restore_time());
++  // The last full-screen video goes: back kRestoreDelay later.
++  watch.SetVideosOnScreen(0, t0 + 30s);
++  assert(!watch.Restore("1080p24hz", false, t0 + 30s + delay - 1s));
++  s = watch.Restore("1080p24hz", false, t0 + 30s + delay);
++  assert(s && s->name == "1080p60hz");
++
++  // Full screen: the bounds cover the whole window (the watch page); a home screen
++  // preview is a window inside it.
++  assert(CoversWindow(0, 0, 1920, 1080, 1920, 1080));
++  assert(CoversWindow(-2, -2, 1924, 1084, 1920, 1080));
++  assert(!CoversWindow(100, 100, 640, 360, 1920, 1080));
++  assert(!CoversWindow(0, 0, 1920, 1000, 1920, 1080));
++  assert(!CoversWindow(0, 0, 0, 0, 0, 0));           // no window yet
++  assert(!FillsWindow(0, 0, 1920, 1080));            // window size not known yet
++  SetWindowSize(1920, 1080);
++  assert(FillsWindow(0, 0, 1920, 1080) && !FillsWindow(100, 100, 640, 360));
++
+   // The mode for a WxH picture after the display changed (hotplug, another TV).
+   std::vector<OutputMode> outputs = {
+       {"2160p60hz", 3840, 2160, false, 60}, {"1080i60hz", 1920, 1080, true, 60},
+diff --git a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/application_rdk.cc b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/application_rdk.cc
+index f319f6d31a6..05a546375ff 100644
+--- a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/application_rdk.cc
++++ b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/application_rdk.cc
+@@ -41,7 +41,7 @@
+ #include "third_party/starboard/rdk/shared/time_constants.h"
+ #include "third_party/starboard/rdk/shared/platform/platform_interface.h"
+ #include "third_party/starboard/rdk/shared/libcobalt.h"
+-#if defined(COREELEC_GBM)
++#if defined(COREELEC)
+ #include "third_party/starboard/rdk/shared/coreelec_display.h"
+ #endif
+ 
+@@ -345,6 +345,10 @@ SbWindow ApplicationRdk::CreateSbWindow(const SbWindowOptions* options) {
+   native_window_ = &fb_window_;
+   SB_LOG(INFO) << "fbdev window " << window_width_ << 'x' << window_height_;
+ #endif
++#if defined(COREELEC)
++  // Players' bounds are in window pixels: a full-screen video covers this.
++  ::third_party::starboard::rdk::shared::coreelec::SetWindowSize(window_width_, window_height_);
++#endif
+ #else
+   if (window_ != nullptr || !ctx_) {
+     return kSbWindowInvalid;
+diff --git a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.cc b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.cc
+index 26e0b650c96..5ea5a85bbe1 100644
+--- a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.cc
++++ b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.cc
+@@ -3,6 +3,8 @@
+ 
+ #include "third_party/starboard/rdk/shared/coreelec_display.h"
+ 
++#include <algorithm>
++#include <atomic>
+ #include <cmath>
+ #include <condition_variable>
+ #include <cstdio>
+@@ -388,7 +390,7 @@ std::optional<ModeSwitch> AutoFrameRate::Choose(const std::string& allowed,
+                                                 Clock::time_point now,
+                                                 std::string* why) {
+   if (!(frame_rate > 0)) {
+-    if (original_ && !restore_at_) {
++    if (original_ && !restore_at_ && videos_on_screen_ == 0) {
+       restore_at_ = now + kRestoreDelay;
+     }
+     return std::nullopt;
+@@ -420,10 +422,48 @@ std::optional<ModeSwitch> AutoFrameRate::Restore(const std::string& current,
+   return back;
+ }
+ 
++void AutoFrameRate::SetVideosOnScreen(int count, Clock::time_point now) {
++  const bool was_on_screen = videos_on_screen_ > 0;
++  videos_on_screen_ = count;
++  if (count > 0) {
++    restore_at_.reset();
++  } else if (was_on_screen && original_ && !restore_at_) {
++    restore_at_ = now + kRestoreDelay;
++  }
++}
++
+ void ResetFrameRate() {
+   SetFrameRate(0);
+ }
+ 
++bool CoversWindow(int x, int y, int width, int height, int window_width, int window_height) {
++  return window_width > 0 && window_height > 0 && x <= 0 && y <= 0 &&
++         x + width >= window_width && y + height >= window_height;
++}
++
++namespace {
++std::atomic<int> g_window_width{0};
++std::atomic<int> g_window_height{0};
++}  // namespace
++
++void SetWindowSize(int width, int height) {
++  g_window_width = width;
++  g_window_height = height;
++}
++
++bool FillsWindow(int x, int y, int width, int height) {
++  return CoversWindow(x, y, width, height, g_window_width, g_window_height);
++}
++
++void SetVideoOnScreen(bool on_screen) {
++  static int videos = 0;  // guarded by g_frame_rate_mutex
++  std::lock_guard<std::mutex> lock(g_frame_rate_mutex);
++  videos = std::max(0, videos + (on_screen ? 1 : -1));
++  g_frame_rate.SetVideosOnScreen(videos, AutoFrameRate::Clock::now());
++  g_frame_rate_thread.Start();
++  g_frame_rate_wake.notify_all();
++}
++
+ void SetModeSetter(ModeSetter setter) {
+   std::lock_guard<std::mutex> lock(g_setter_mutex);
+   g_setter = std::move(setter);
+diff --git a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.h b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.h
+index 0e40ef43f47..18e5b3fb332 100644
+--- a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.h
++++ b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.h
+@@ -78,7 +78,8 @@ class AutoFrameRate {
+ 
+   // The switch for |frame_rate| (see ChooseModeSwitch); it cancels a pending
+   // return. A |frame_rate| of 0 or less means no video wants a rate: the return
+-  // to the mode before the first switch is due kRestoreDelay after |now|.
++  // to the mode before the first switch is due kRestoreDelay after |now|, or
++  // kRestoreDelay after the last full-screen video goes (SetVideosOnScreen).
+   std::optional<ModeSwitch> Choose(const std::string& allowed,
+                                    const std::string& current,
+                                    bool current_fractional,
+@@ -87,6 +88,11 @@ class AutoFrameRate {
+                                    Clock::time_point now,
+                                    std::string* why = nullptr);
+ 
++  // How many full-screen videos are on screen. Each keeps the display's rate (as
++  // a video surface does on Android): it cancels a pending return, and when the
++  // last one goes, the return is due kRestoreDelay after |now|.
++  void SetVideosOnScreen(int count, Clock::time_point now);
++
+   // When the return is due; empty when none is pending.
+   std::optional<Clock::time_point> restore_time() const { return restore_at_; }
+ 
+@@ -99,12 +105,26 @@ class AutoFrameRate {
+  private:
+   std::optional<ModeSwitch> original_;
+   std::optional<Clock::time_point> restore_at_;
++  int videos_on_screen_ = 0;
+ };
+ 
+ // Auto frame rate with nothing playing: the display goes back to its mode from
+ // before (Android drops a rate when its video surface goes away).
+ void ResetFrameRate();
+ 
++// A player's video started (true) or stopped (false) filling the screen.
++void SetVideoOnScreen(bool on_screen);
++
++// Whether a video at these bounds covers a |window_width|x|window_height| window.
++bool CoversWindow(int x, int y, int width, int height, int window_width, int window_height);
++
++// The application window's size, for FillsWindow.
++void SetWindowSize(int width, int height);
++
++// Whether a player's video at these bounds fills the application window (false
++// before SetWindowSize).
++bool FillsWindow(int x, int y, int width, int height);
++
+ // How a switch reaches the display. Without a setter it is written to
+ // /sys/class/display (framebuffer windows); a DRM window, where those writes are
+ // ignored, installs one. Returns false when the switch cannot be made.
+diff --git a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/player/player_internal.cc b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/player/player_internal.cc
+index cd2badbb511..f0d80665b91 100644
+--- a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/player/player_internal.cc
++++ b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/player/player_internal.cc
+@@ -32,6 +32,7 @@
+ #include <gst/base/gstbasetransform.h>
+ #include <gst/base/gstbaseparse.h>
+ 
++#include <atomic>
+ #include <map>
+ #include <string>
+ #include <vector>
+@@ -1703,6 +1704,7 @@ class PlayerImpl : public Player {
+ 
+   bool enforce_sw_decoders_ { false };
+   bool audio_passthrough_ { false };  // COREELEC: audio goes out as a bitstream
++  std::atomic<bool> on_screen_ { false };  // COREELEC: the video fills the screen
+ };
+ 
+ struct PlayerRegistry
+@@ -1969,6 +1971,8 @@ PlayerImpl::~PlayerImpl() {
+   if (audio_passthrough_)
+     ::third_party::starboard::rdk::shared::coreelec::ReleasePassthrough();
+   // The video is gone, and its refresh rate with it (as on Android).
++  if (on_screen_.exchange(false))
++    ::third_party::starboard::rdk::shared::coreelec::SetVideoOnScreen(false);
+   ::third_party::starboard::rdk::shared::coreelec::ResetFrameRate();
+ #endif
+   if (playback_thread_.joinable()) {
+@@ -3032,6 +3036,17 @@ void PlayerImpl::GetInfo(SbPlayerInfo* out_player_info) {
+ 
+ void PlayerImpl::SetBounds(int zindex, const ::starboard::Rect& rect) {
+   GST_TRACE_OBJECT(pipeline_, "Set Bounds: %d %d %d %d %d", zindex, rect.x, rect.y, rect.size.width, rect.size.height);
++#if defined(COREELEC)
++  // A full-screen video keeps the refresh rate auto frame rate chose; a home
++  // screen preview (a window) does not.
++  {
++    namespace coreelec = ::third_party::starboard::rdk::shared::coreelec;
++    const bool on_screen =
++        coreelec::FillsWindow(rect.x, rect.y, rect.size.width, rect.size.height);
++    if (on_screen_.exchange(on_screen) != on_screen)
++      coreelec::SetVideoOnScreen(on_screen);
++  }
++#endif
+   GstElement* vid_sink = nullptr;
+   g_object_get(pipeline_, "video-sink", &vid_sink, nullptr);
+   if (!vid_sink) {
+-- 
+2.47.3
+
