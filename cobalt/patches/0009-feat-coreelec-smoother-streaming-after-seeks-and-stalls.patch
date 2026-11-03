@@ -1,0 +1,172 @@
+From 4df308d901bf0fdd64e550deb9b58f266b818afa Mon Sep 17 00:00:00 2001
+From: samtheruby <peasea1012@gmail.com>
+Date: Tue, 3 Nov 2026 22:13:35 +0000
+Subject: [PATCH 2/2] feat(coreelec): smoother YouTube streaming after seeks
+ and stalls
+
+After a far seek YouTube's server can send a video slowly; the player then
+aborted each slow download after a few seconds and threw its data away, so
+playback looped between a few seconds of video and long stalls. After a
+stall it also resumed with very little buffered and stalled again.
+Inject a page script at document start, as SmartTube's player behaves:
+a videoplayback download that is aborted while data still arrives is left
+to finish (aborts right after a seek, of stalled or old downloads go
+through), and after a stall playback resumes only with 5 s buffered
+(2.5 s within 5 s of a seek). List the injected scripts as inputs, so a
+new or changed one regenerates the embedded header.
+---
+ cobalt/shell/BUILD.gn                         |   7 +
+ .../coretube_sabr.js                          | 123 ++++++++++++++++++
+ 2 files changed, 130 insertions(+)
+ create mode 100644 cobalt/shell/embedded_resources/cobalt_java_script_polyfill/coretube_sabr.js
+
+diff --git a/cobalt/shell/BUILD.gn b/cobalt/shell/BUILD.gn
+index ea2d443b174..be7bf68f8fc 100644
+--- a/cobalt/shell/BUILD.gn
++++ b/cobalt/shell/BUILD.gn
+@@ -539,6 +539,13 @@ action("embed_polyfilled_javascript") {
+   outputs = [ "$target_gen_dir/embedded_resources/embedded_js.h" ]
+   public_configs = [ ":embed_polyfilled_javascript_config" ]
+ 
++  # The script embeds every file in the folder; listed, a change or a new one
++  # regenerates the header.
++  inputs = [
++    "embedded_resources/cobalt_java_script_polyfill/coretube_sabr.js",
++    "embedded_resources/cobalt_java_script_polyfill/html_media_element_extension_on_java_bridge.js",
++  ]
++
+   args = [
+     "CobaltJavaScriptPolyfill",
+     rebase_path(outputs[0], root_build_dir),
+diff --git a/cobalt/shell/embedded_resources/cobalt_java_script_polyfill/coretube_sabr.js b/cobalt/shell/embedded_resources/cobalt_java_script_polyfill/coretube_sabr.js
+new file mode 100644
+index 00000000000..171cd0bbafd
+--- /dev/null
++++ b/cobalt/shell/embedded_resources/cobalt_java_script_polyfill/coretube_sabr.js
+@@ -0,0 +1,123 @@
++/**
++ * @license
++ * Copyright Team CoreELEC (https://coreelec.org)
++ * SPDX-License-Identifier: BSD-3-Clause
++ */
++// CoreTube: smoother YouTube (SABR) streaming, as SmartTube's player does it.
++// - A videoplayback download that YouTube aborts while data still arrives is
++//   left to finish: after a far seek the server can be slow, and the player
++//   kept aborting each slow download and throwing its data away.
++// - After a stall, playback resumes only with 5 s buffered (2.5 s within 5 s of
++//   a seek), instead of playing a second and stalling again.
++(function () {
++  'use strict';
++  if (window.__coretubeSabr || !/(^|\.)youtube\.com$/.test(location.hostname)) return;
++  window.__coretubeSabr = true;
++
++  var ALIVE_MS = 2000;        // a download received data this recently: alive
++  var SEEK_GRACE_MS = 3000;   // aborts right after a seek go through
++  var MAX_AGE_MS = 60000;     // an older download may be aborted
++  var RESUME_S = 5;           // buffered ahead to resume after a stall
++  var RESUME_AFTER_SEEK_S = 2.5;
++  var SEEK_WINDOW_MS = 5000;  // a stall this soon after a seek uses RESUME_AFTER_SEEK_S
++  var GATE_MAX_MS = 60000;    // never hold playback longer than this
++
++  var now = function () { return performance.now(); };
++  var log = function (msg) { console.info('[CoreTube] ' + msg); };
++  var lastSeek = -1e9;
++  document.addEventListener('seeking', function () { lastSeek = now(); }, true);
++
++  // --- Keep slow downloads alive -------------------------------------------
++  var downloads = new WeakMap();  // AbortSignal -> {start, last, done}
++  var origFetch = window.fetch;
++  window.fetch = function (input, init) {
++    var url = typeof input === 'string' ? input : input && input.url;
++    var res = origFetch.apply(this, arguments);
++    var signal = (init && init.signal) || (input instanceof Request ? input.signal : null);
++    if (signal && typeof url === 'string' && url.indexOf('videoplayback') >= 0) {
++      var d = { start: now(), last: now(), done: false };
++      downloads.set(signal, d);
++      res.then(function (resp) {
++        var body = resp.clone().body;
++        if (!body) return;
++        var reader = body.getReader();
++        var pump = function () {
++          reader.read().then(function (r) {
++            if (r.done) { d.done = true; return; }
++            d.last = now();
++            pump();
++          }, function () { d.done = true; });
++        };
++        pump();
++      }, function () { d.done = true; });
++    }
++    return res;
++  };
++  var origAbort = AbortController.prototype.abort;
++  AbortController.prototype.abort = function () {
++    var d = downloads.get(this.signal);
++    if (d && !d.done) {
++      var t = now();
++      if (t - d.last < ALIVE_MS && t - lastSeek >= SEEK_GRACE_MS && t - d.start <= MAX_AGE_MS) {
++        log('kept a download still receiving data (' + Math.round((t - d.start) / 1000) + ' s old)');
++        return undefined;
++      }
++    }
++    return origAbort.apply(this, arguments);
++  };
++
++  // --- Resume only with enough buffered -------------------------------------
++  var origPause = HTMLMediaElement.prototype.pause;
++  var origPlay = HTMLMediaElement.prototype.play;
++  var gate = null;      // {video, need, since, timer} while holding playback
++  var hide = { pause: 0, play: 0 };  // our own pause/play events, kept from the page
++
++  var bufferedAhead = function (v) {
++    for (var i = 0; i < v.buffered.length; i++) {
++      if (v.buffered.start(i) <= v.currentTime + 0.1 && v.currentTime <= v.buffered.end(i))
++        return v.buffered.end(i) - v.currentTime;
++    }
++    return 0;
++  };
++  var endGate = function (resume) {
++    var g = gate;
++    gate = null;
++    clearInterval(g.timer);
++    if (resume) {
++      hide.play++;
++      origPlay.call(g.video).catch(function () {});
++      log('resumed with ' + bufferedAhead(g.video).toFixed(1) + ' s buffered after ' +
++          Math.round((now() - g.since) / 100) / 10 + ' s');
++    }
++  };
++  ['pause', 'play'].forEach(function (type) {
++    window.addEventListener(type, function (e) {
++      if (hide[type] > 0 && e.target instanceof HTMLMediaElement) {
++        hide[type]--;
++        e.stopImmediatePropagation();
++      }
++    }, true);
++  });
++  // A pause or play from the page (the user) ends the hold without resuming.
++  HTMLMediaElement.prototype.pause = function () {
++    if (gate && gate.video === this) endGate(false);
++    return origPause.apply(this, arguments);
++  };
++  HTMLMediaElement.prototype.play = function () {
++    if (gate && gate.video === this) endGate(false);
++    return origPlay.apply(this, arguments);
++  };
++  document.addEventListener('waiting', function (e) {
++    var v = e.target;
++    if (gate || !(v instanceof HTMLVideoElement) || v.paused || v.ended) return;
++    var need = now() - lastSeek < SEEK_WINDOW_MS ? RESUME_AFTER_SEEK_S : RESUME_S;
++    gate = { video: v, need: need, since: now() };
++    hide.pause++;
++    origPause.call(v);
++    log('stalled: holding playback until ' + need + ' s are buffered');
++    gate.timer = setInterval(function () {
++      var near = isFinite(v.duration) && v.currentTime + bufferedAhead(v) >= v.duration - 0.5;
++      if (bufferedAhead(v) >= gate.need || near || now() - gate.since > GATE_MAX_MS) endGate(true);
++    }, 250);
++  }, true);
++})();
+-- 
+2.47.3
+
