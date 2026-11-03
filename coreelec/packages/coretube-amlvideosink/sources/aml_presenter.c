@@ -36,6 +36,7 @@ struct AmlPresenter {
   gint64 intervals[AML_PACER_VSYNC_SAMPLES];
   guint n_intervals;
   gint64 last_vsync;
+  guint64 shown, repeated, dropped; /* since new */
   void (*shown_callback)(gpointer);
   gpointer shown_data;
 };
@@ -68,19 +69,17 @@ static void hand_back(AmlPresenter *p, const HeldFrame *frame, gboolean drop)
 
 /* Shows the frame due (or the preroll picture), drops late ones. TRUE on the first
  * frame shown since start. */
-static gboolean present(AmlPresenter *p, gint64 running)
+static gboolean present(AmlPresenter *p, gboolean vsync, gint64 running)
 {
   AmlFrame frames[AML_PACER_MAX_FRAMES];
   AmlPick pick = {.show = -1};
   gboolean first = FALSE;
   guint kept = 0;
 
-  if (!p->n_held)
-    return FALSE;
   for (guint i = 0; i < p->n_held; i++)
     frames[i] = (AmlFrame){p->held[i].index, p->held[i].running_us};
 
-  if (p->playing && running >= 0) {
+  if (p->playing && running >= 0 && p->n_held) {
     gint64 vsync = aml_pacer_vsync_us(p->intervals, p->n_intervals);
 
     pick = aml_pacer_pick(frames, p->n_held, running + vsync, vsync);
@@ -106,6 +105,12 @@ static gboolean present(AmlPresenter *p, gint64 running)
       p->held[kept++] = p->held[i];
   }
   p->n_held = kept;
+  /* A vsync without a new frame repeats the one on screen. */
+  if (pick.show < 0 && vsync && p->shown_since_start)
+    p->repeated++;
+  if (pick.show >= 0)
+    p->shown++;
+  p->dropped += pick.n_drop;
   if (pick.show >= 0 && !p->shown_since_start)
     first = p->shown_since_start = TRUE;
   if (pick.show >= 0 || pick.n_drop)
@@ -151,7 +156,7 @@ static gpointer run(gpointer data)
     record_vsync(p, ret > 0, now);
     while (p->n_held < AML_PACER_MAX_FRAMES && p->ops->dequeue(p->ctx, &index, &pts) == 0)
       p->held[p->n_held++] = (HeldFrame){index, pts, frame_running_us(p, pts)};
-    first = present(p, running);
+    first = present(p, ret > 0, running);
     g_mutex_unlock(&p->lock);
 
     if (first && p->shown_callback)
@@ -235,6 +240,15 @@ guint64 aml_presenter_wait_shown(AmlPresenter *p, guint64 pts_us, gint64 timeout
   handled = p->handled_pts;
   g_mutex_unlock(&p->lock);
   return handled;
+}
+
+void aml_presenter_get_stats(AmlPresenter *p, guint64 *shown, guint64 *repeated, guint64 *dropped)
+{
+  g_mutex_lock(&p->lock);
+  *shown = p->shown;
+  *repeated = p->repeated;
+  *dropped = p->dropped;
+  g_mutex_unlock(&p->lock);
 }
 
 void aml_presenter_set_shown_callback(AmlPresenter *p, void (*callback)(gpointer), gpointer data)

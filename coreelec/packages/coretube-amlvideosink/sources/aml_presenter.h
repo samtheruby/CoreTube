@@ -33,6 +33,8 @@ void aml_presenter_set_playing(AmlPresenter *p, gboolean playing);
 /* Waits until the frame with this timestamp (or a later one) was shown or dropped, at
  * most timeout_us. Returns the highest timestamp shown or dropped since start, 0 for none. */
 guint64 aml_presenter_wait_shown(AmlPresenter *p, guint64 pts_us, gint64 timeout_us);
+/* Frames shown, vsyncs that repeated the frame on screen, and frames dropped, since new. */
+void aml_presenter_get_stats(AmlPresenter *p, guint64 *shown, guint64 *repeated, guint64 *dropped);
 /* Called from the thread on the first frame shown after each start. */
 void aml_presenter_set_shown_callback(AmlPresenter *p, void (*callback)(gpointer), gpointer data);
 /* Flushes first. */

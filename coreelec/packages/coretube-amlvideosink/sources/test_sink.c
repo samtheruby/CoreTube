@@ -479,9 +479,9 @@ typedef struct {
   guint polls, bad_timeouts;
   gint64 now, base;     /* fake clock; running time = now - base while the clock runs */
   gboolean clock_running;
-  struct { guint index; guint64 pts; } decoded[64];
+  struct { guint index; guint64 pts; } decoded[512];
   guint n_decoded, next_decoded;
-  struct { guint index; gboolean drop; } log[256];
+  struct { guint index; gboolean drop; } log[1024];
   guint n_log;
 } FakeVideo;
 
@@ -736,6 +736,22 @@ static void test_frame_without_pts_is_shown(void)
   fake_video_free(f);
 }
 
+/* 23.976 fps on 60 Hz through the presenter: per vsync a new frame or a repeat. */
+static void test_stats_count_shown_repeated_dropped(void)
+{
+  FakeVideo *f = fake_video_new();
+  guint64 shown, repeated, dropped;
+
+  for (guint i = 0; i < 260; i++)
+    decoded(f, i, (guint64)i * 41708 + 1);
+  play(f, -16667); /* the first vsync is at running time 0 */
+  aml_presenter_start(f->presenter);
+  tick(f, 600, TRUE);
+  aml_presenter_get_stats(f->presenter, &shown, &repeated, &dropped);
+  assert(shown == 240 && repeated == 360 && dropped == 0);
+  fake_video_free(f);
+}
+
 /* End of stream waits for the last frame on screen, or gives up at the timeout. */
 static void test_wait_shown(void)
 {
@@ -850,6 +866,7 @@ int main(void)
   test_frame_without_pts_is_shown();
   test_wait_shown();
   test_wait_shown_counts_dropped_frames();
+  test_stats_count_shown_repeated_dropped();
   g_print("all sink tests passed\n");
   return 0;
 }

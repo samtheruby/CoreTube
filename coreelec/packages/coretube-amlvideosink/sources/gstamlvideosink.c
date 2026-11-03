@@ -72,6 +72,8 @@ static gboolean load_amcodec(void)
 #define LEAD_TIME (500 * GST_MSECOND)
 /* Longest wait at end of stream for the last frame to be shown. */
 #define EOS_TIMEOUT (2 * G_USEC_PER_SEC)
+/* How often the frame pacing counts are logged. */
+#define STATS_INTERVAL (10 * G_USEC_PER_SEC)
 
 /* Longest the screen stays muted while a decoder (re)starts. */
 #ifndef VIDEO_HOLD_TIMEOUT
@@ -107,6 +109,7 @@ struct _GstAmlVideoSink {
   int video_fd;     /* amlvideo, while open */
   AmlPresenter *presenter; /* while open */
   GstBuffer *prerolled; /* sent to the decoder at preroll; render skips it */
+  gint64 next_stats; /* monotonic time of the next pacing log */
   gchar *config;    /* decoder config string; codec.config points here while open */
   gint saved_blackout; /* blackout_policy before the decoder opened; -1 when not changed */
   GstPadChainFunction base_chain; /* GstBaseSink's, for frames inside the segment */
@@ -710,12 +713,28 @@ static GstFlowReturn write_frame(GstAmlVideoSink *self, GstBuffer *buffer)
   return ret;
 }
 
+/* A box log shows the cadence without a debug build: at 24 fps on 24 Hz nearly no
+ * repeats or drops; on 60 Hz 1.5 repeats per frame shown. */
+static void log_stats(GstAmlVideoSink *self)
+{
+  gint64 now = g_get_monotonic_time();
+  guint64 shown, repeated, dropped;
+
+  if (now < self->next_stats)
+    return;
+  self->next_stats = now + STATS_INTERVAL;
+  aml_presenter_get_stats(self->presenter, &shown, &repeated, &dropped);
+  GST_INFO_OBJECT(self, "presented %" G_GUINT64_FORMAT ", repeated %" G_GUINT64_FORMAT ", dropped %" G_GUINT64_FORMAT,
+      shown, repeated, dropped);
+}
+
 static GstFlowReturn gst_aml_video_sink_render(GstBaseSink *bsink, GstBuffer *buffer)
 {
   GstAmlVideoSink *self = GST_AML_VIDEO_SINK(bsink);
 
   if (!self->open)
     return GST_FLOW_NOT_NEGOTIATED;
+  log_stats(self);
   if (buffer == self->prerolled) { /* the decoder has it since the preroll */
     gst_buffer_replace(&self->prerolled, NULL);
     return GST_FLOW_OK;
