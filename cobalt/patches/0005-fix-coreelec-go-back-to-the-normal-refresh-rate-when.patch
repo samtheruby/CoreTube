@@ -1,0 +1,179 @@
+From a379ab869f1b96606e3f19199510d068087748d3 Mon Sep 17 00:00:00 2001
+From: samtheruby <peasea1012@gmail.com>
+Date: Tue, 3 Nov 2026 16:40:26 +0000
+Subject: [PATCH] fix(coreelec): go back to the normal refresh rate when the
+ video ends
+
+Auto frame rate switched the HDMI mode and never switched back, so the home
+screen and its previews stayed at the last video's rate (30 fps previews at
+24 Hz). On Android the rate is a hint on the video surface and goes away with
+it. Remember the mode from before the first switch and return to it on
+SetFrameRate(0), which TizenTube sends before each new video, and when the
+player is destroyed.
+---
+ .../coreelec/tests/coreelec_display_test.cc   | 19 ++++++++
+ .../starboard/rdk/shared/coreelec_display.cc  | 47 +++++++++++++++++--
+ .../starboard/rdk/shared/coreelec_display.h   | 20 ++++++++
+ .../rdk/shared/player/player_internal.cc      |  3 ++
+ 4 files changed, 84 insertions(+), 5 deletions(-)
+
+diff --git a/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/tests/coreelec_display_test.cc b/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/tests/coreelec_display_test.cc
+index 24da3fefaea..e924f4b1a4b 100644
+--- a/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/tests/coreelec_display_test.cc
++++ b/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/tests/coreelec_display_test.cc
+@@ -56,6 +56,25 @@ int main() {
+   assert(!ChooseModeSwitch(modes, "1080i60hz", false, caps, 24));          // interlaced now
+   assert(!ChooseModeSwitch(modes, "1080p60hz", false, caps, 0));
+ 
++  // Frame rate 0 (no video, or a new one coming) goes back to the mode before
++  // auto frame rate first switched, as Android drops a video surface's rate.
++  AutoFrameRate afr;
++  assert(!afr.Choose(modes, "1080p60hz", false, caps, 0));               // nothing to undo
++  s = afr.Choose(modes, "1080p60hz", false, caps, 24);
++  assert(s && s->name == "1080p24hz" && !s->fractional);
++  s = afr.Choose(modes, "1080p24hz", false, caps, 23.976);
++  assert(s && s->name == "1080p24hz" && s->fractional);
++  s = afr.Choose(modes, "1080p24hz", true, caps, 0);
++  assert(s && s->name == "1080p60hz" && !s->fractional && s->suffix.empty());
++  assert(!afr.Choose(modes, "1080p60hz", false, caps, 0));               // already back
++  s = afr.Choose(modes, "1080p59hz", false, caps, 0);
++  assert(!s);                                                            // nothing left to undo
++  // A 59.94 Hz start, kept with its suffix.
++  s = afr.Choose(modes, "1080p60hz420", true, caps, 24);
++  assert(s && s->name == "1080p24hz");
++  s = afr.Choose(modes, "1080p24hz420", false, caps, 0);
++  assert(s && s->name == "1080p60hz" && s->fractional && s->suffix == "420");
++
+   // The mode for a WxH picture after the display changed (hotplug, another TV).
+   std::vector<OutputMode> outputs = {
+       {"2160p60hz", 3840, 2160, false, 60}, {"1080i60hz", 1920, 1080, true, 60},
+diff --git a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.cc b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.cc
+index 5a41ac4857f..891e86d6b52 100644
+--- a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.cc
++++ b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.cc
+@@ -62,21 +62,29 @@ bool DisplayTakes(const std::string& display_caps, const std::string& name) {
+ 
+ std::mutex g_setter_mutex;
+ ModeSetter g_setter;
++std::mutex g_frame_rate_mutex;  // one switch at a time; guards g_frame_rate
++AutoFrameRate g_frame_rate;
+ 
+ void SetFrameRate(float frame_rate) {
++  std::lock_guard<std::mutex> switching(g_frame_rate_mutex);
+   const char* allowed = getenv("TIZENTUBE_DISPLAY_MODES");
+   std::string why;
+-  auto target = ChooseModeSwitch(allowed ? allowed : "", ReadFile(kModePath),
+-                                 ReadFile(kFracRatePath) == "1",
+-                                 ReadFile(kDisplayCapsPath), frame_rate, &why);
++  auto target = g_frame_rate.Choose(allowed ? allowed : "", ReadFile(kModePath),
++                                    ReadFile(kFracRatePath) == "1",
++                                    ReadFile(kDisplayCapsPath), frame_rate, &why);
+   if (!target) {
+     if (!why.empty()) {
+       SB_LOG(INFO) << "Auto frame rate: " << why;
+     }
+     return;
+   }
+-  SB_LOG(INFO) << "Auto frame rate: " << frame_rate << " fps, switching to "
+-               << target->name << (target->fractional ? " (1000/1001)" : "");
++  if (frame_rate > 0) {
++    SB_LOG(INFO) << "Auto frame rate: " << frame_rate << " fps, switching to "
++                 << target->name << (target->fractional ? " (1000/1001)" : "");
++  } else {
++    SB_LOG(INFO) << "Auto frame rate: no video, back to " << target->name
++                 << (target->fractional ? " (1000/1001)" : "");
++  }
+   ModeSetter setter;
+   {
+     std::lock_guard<std::mutex> lock(g_setter_mutex);
+@@ -293,6 +301,35 @@ std::optional<ModeSwitch> ChooseModeSwitch(const std::string& allowed,
+   return target;
+ }
+ 
++std::optional<ModeSwitch> AutoFrameRate::Choose(const std::string& allowed,
++                                                const std::string& current,
++                                                bool current_fractional,
++                                                const std::string& display_caps,
++                                                double frame_rate,
++                                                std::string* why) {
++  if (!(frame_rate > 0)) {
++    std::optional<ModeSwitch> back = std::move(original_);
++    original_.reset();
++    if (back && current == back->name + back->suffix &&
++        current_fractional == back->fractional) {
++      return std::nullopt;
++    }
++    return back;
++  }
++  auto target = ChooseModeSwitch(allowed, current, current_fractional,
++                                 display_caps, frame_rate, why);
++  auto mode = ParseMode(current);
++  if (target && !original_ && mode) {
++    original_ = ModeSwitch{mode->prefix + std::to_string(mode->rate) + "hz",
++                           current_fractional, mode->suffix};
++  }
++  return target;
++}
++
++void ResetFrameRate() {
++  SetFrameRate(0);
++}
++
+ void SetModeSetter(ModeSetter setter) {
+   std::lock_guard<std::mutex> lock(g_setter_mutex);
+   g_setter = std::move(setter);
+diff --git a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.h b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.h
+index 59cf5b64632..414bbf527d9 100644
+--- a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.h
++++ b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.h
+@@ -67,6 +67,26 @@ std::optional<ModeSwitch> ChooseModeSwitch(const std::string& allowed,
+                                            double frame_rate,
+                                            std::string* why = nullptr);
+ 
++// Auto frame rate across videos: remembers the mode it first switched away from.
++class AutoFrameRate {
++ public:
++  // The switch for |frame_rate| (see ChooseModeSwitch). A |frame_rate| of 0 or
++  // less means no video wants a rate: back to the mode before the first switch.
++  std::optional<ModeSwitch> Choose(const std::string& allowed,
++                                   const std::string& current,
++                                   bool current_fractional,
++                                   const std::string& display_caps,
++                                   double frame_rate,
++                                   std::string* why = nullptr);
++
++ private:
++  std::optional<ModeSwitch> original_;
++};
++
++// Auto frame rate with nothing playing: the display goes back to its mode from
++// before (Android drops a rate when its video surface goes away).
++void ResetFrameRate();
++
+ // How a switch reaches the display. Without a setter it is written to
+ // /sys/class/display (framebuffer windows); a DRM window, where those writes are
+ // ignored, installs one. Returns false when the switch cannot be made.
+diff --git a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/player/player_internal.cc b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/player/player_internal.cc
+index 5100841a582..87742f76bc2 100644
+--- a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/player/player_internal.cc
++++ b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/player/player_internal.cc
+@@ -65,6 +65,7 @@
+ #include "third_party/starboard/rdk/shared/player/elements/gst_audio_clipping.h"
+ #if defined(COREELEC)
+ #include "third_party/starboard/rdk/shared/coreelec_audio.h"
++#include "third_party/starboard/rdk/shared/coreelec_display.h"
+ #endif
+ 
+ namespace starboard {
+@@ -1967,6 +1968,8 @@ PlayerImpl::~PlayerImpl() {
+   // The sink has closed the device; the output can go back to PCM.
+   if (audio_passthrough_)
+     ::third_party::starboard::rdk::shared::coreelec::ReleasePassthrough();
++  // The video is gone, and its refresh rate with it (as on Android).
++  ::third_party::starboard::rdk::shared::coreelec::ResetFrameRate();
+ #endif
+   if (playback_thread_.joinable()) {
+     DispatchOnWorkerThread(new PlayerDestroyedTask(
+-- 
+2.47.3
+
