@@ -4,6 +4,7 @@
 #define SYSFS_ROOT "/tmp/fakesys"
 #define VIDEO_HOLD_TIMEOUT (200 * GST_MSECOND)
 #include "gstamlvideosink.c"
+#include "aml_pacer.c"
 #include <assert.h>
 
 static GByteArray *written;
@@ -226,6 +227,119 @@ static void test_preroll_after_seek(void)
   gst_caps_unref(h264);
 }
 
+/* Plays frames every frame_us on a display with a vsync every vsync_us. A frame queued
+ * at vsync k appears at running time k * vsync_us. Counts how many vsyncs each frame
+ * stays on screen, the frames dropped, and the vsyncs that showed nothing new. */
+typedef struct { guint on_screen[4096]; guint drops, repeats, last_shown; } Paced;
+
+static void pace(Paced *r, gint64 frame_us, gint64 vsync_us, guint vsyncs)
+{
+  AmlFrame queue[16];
+  guint n = 0, next = 0;
+  gint current = -1;
+
+  memset(r, 0, sizeof(*r));
+  for (guint k = 0; k < vsyncs; k++) {
+    AmlPick pick;
+    guint kept = 0;
+
+    for (; n < G_N_ELEMENTS(queue); n++, next++)
+      queue[n] = (AmlFrame){next, (gint64)next * frame_us};
+    pick = aml_pacer_pick(queue, n, (gint64)k * vsync_us, vsync_us);
+    r->drops += pick.n_drop;
+    if (pick.show >= 0)
+      current = pick.show;
+    else if (current >= 0)
+      r->repeats++;
+    if (current >= 0) {
+      r->on_screen[current]++;
+      r->last_shown = (guint)current;
+    }
+    for (guint i = 0; i < n; i++) {
+      gboolean gone = (gint)queue[i].index == pick.show;
+
+      for (guint d = 0; d < pick.n_drop; d++)
+        gone |= queue[i].index == pick.drop[d];
+      if (!gone)
+        queue[kept++] = queue[i];
+    }
+    n = kept;
+  }
+}
+
+/* 23.976 fps on 60 Hz: 3:2, each frame on screen 2 or 3 vsyncs in turn. The 0.1%
+ * rate difference may break the alternation once in 10 s; never a drop. */
+static void test_cadence_24_on_60(void)
+{
+  Paced r;
+  guint breaks = 0;
+
+  pace(&r, 41708, 16667, 600);
+  assert(r.drops == 0 && r.last_shown >= 238);
+  for (guint i = 0; i < r.last_shown; i++) {
+    assert(r.on_screen[i] == 2 || r.on_screen[i] == 3);
+    if (i > 0 && r.on_screen[i] == r.on_screen[i - 1])
+      breaks++;
+  }
+  assert(breaks <= 1);
+}
+
+/* 23.976 fps on 24 Hz: the frame on screen repeats once every ~1000 vsyncs. */
+static void test_cadence_23976_on_24(void)
+{
+  Paced r;
+
+  pace(&r, 41708, 41667, 3000);
+  assert(r.drops == 0);
+  assert(r.repeats == 3);
+}
+
+static void test_late_frames_dropped(void)
+{
+  AmlFrame queue[] = {{0, 0}, {1, 16667}, {2, 33334}};
+  AmlPick pick = aml_pacer_pick(queue, 3, 50000, 16667);
+
+  assert(pick.show == 2);
+  assert(pick.n_drop == 2 && pick.drop[0] == 0 && pick.drop[1] == 1);
+}
+
+static void test_before_segment_dropped(void)
+{
+  AmlFrame queue[] = {{7, -40000}, {8, -20000}, {9, 0}};
+  AmlPick pick = aml_pacer_pick(queue, 3, 0, 16667);
+
+  assert(pick.show == 9);
+  assert(pick.n_drop == 2 && pick.drop[0] == 7 && pick.drop[1] == 8);
+}
+
+/* Nothing due yet: show nothing, drop nothing. */
+static void test_nothing_due(void)
+{
+  AmlFrame queue[] = {{0, 100000}};
+  AmlPick pick = aml_pacer_pick(queue, 1, 50000, 16667);
+
+  assert(pick.show == -1 && pick.n_drop == 0);
+}
+
+/* 30 fps at 2x speed on 60 Hz: running times every 16667 us, each frame shown once. */
+static void test_double_speed_shows_each_frame_once(void)
+{
+  Paced r;
+
+  pace(&r, 16667, 16667, 600);
+  assert(r.drops == 0 && r.repeats == 0);
+  for (guint i = 0; i < 600; i++)
+    assert(r.on_screen[i] == 1);
+}
+
+static void test_vsync_median(void)
+{
+  const gint64 intervals[] = {16600, 16700, 16650, 99999, 16680, 16640, 16660, 16670};
+
+  assert(aml_pacer_vsync_us(intervals, 8) == 16665);
+  assert(aml_pacer_vsync_us(intervals, 3) == 16667);
+}
+
 /* The S922Z box's vcodec_profile (excerpt), and one with AV1 hardware. */
 static const char *g12b = "h264:4k;\nhevc:8k, 8bit, 10bit, dwrite, compressed, frame_dv, fence;\nav1_unsupport:;\nmav1:;\nvp9:8k, 10bit, dwrite, compressed, fence;\n";
 static const char *s905x4 = "h264:4k;\nav1:4k, 10bit, dwrite, compressed;\nvp9:4k, 10bit;\n";
@@ -282,6 +396,13 @@ int main(void)
   test_decoder_sysfs();
   test_seek_inside_gop();
   test_preroll_after_seek();
+  test_cadence_24_on_60();
+  test_cadence_23976_on_24();
+  test_late_frames_dropped();
+  test_before_segment_dropped();
+  test_nothing_due();
+  test_double_speed_shows_each_frame_once();
+  test_vsync_median();
   g_print("all sink tests passed\n");
   return 0;
 }
