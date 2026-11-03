@@ -4,13 +4,16 @@
 # Copyright (C) 2026-present Team CoreELEC (https://coreelec.org)
 
 # Runs after Cobalt ends, before Kodi starts again (see default.py). The video
-# sink mutes the HDMI output while a video starts; if Cobalt crashed in that
-# moment, the mute is still on and Kodi would come back to a black screen.
+# sink and auto frame rate mute the HDMI output for a moment; if Cobalt ended
+# then, the mute is still on and Kodi would come back to a black screen. The
+# kernel counts mute requests: each "0" takes one away (at most 16 here).
 root=${TIZENTUBE_ROOT:-}  # tests point /sys and /run at a fake tree
 mute=${root}/sys/class/amhdmitx/amhdmitx0/vid_mute
-if [ -w "${mute}" ] && [ "$(cat "${mute}")" != 0 ]; then
+n=0
+while [ -w "${mute}" ] && [ "$(cat "${mute}")" != 0 ] && [ "${n}" -lt 16 ]; do
   echo 0 > "${mute}"
-fi
+  n=$((n + 1))
+done
 
 # Auto frame rate may have left the TV at another refresh rate; Kodi expects the
 # mode it had (saved by tizentube-start).
