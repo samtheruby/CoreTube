@@ -89,7 +89,9 @@ work_dir=$(realpath -m "$work_dir")
 
 version=$(python3 -I -c 'import sys, xml.etree.ElementTree as E; print(E.parse(sys.argv[1]).getroot().get("version"))' "$repo/addon/addon.xml")
 zip_file=$repo/out/$arch/browser.tizentube-$version.zip
-ce=$work_dir/coreelec-$tag
+# The CoreELEC checkout lives in the build folder: the packages step, which runs as
+# that folder's owner, is the only one that writes it.
+ce=$build_dir/coretube/coreelec-$tag
 ce_build=$build_dir/$ce_subdir
 src=$cobalt_dir/src
 out=$src/out/${platform}_qa
@@ -126,7 +128,7 @@ in_docker() {
   local -a extra=()
   [ "$allow_rebuild" = 0 ] || extra+=(--allow-rebuild)
   echo "== $step (docker $image, user $user)"
-  docker run --rm --user "$user" -e HOME=/work/home \
+  docker run --rm --user "$user" -e HOME=/tmp/home \
     -v "$(map_path "$repo")":/coretube -v "$(map_path "$work_dir")":/work \
     -v "$(map_path "$build_dir")":/build -v "$(map_path "$cobalt_dir")":/cobalt \
     "$image" bash /coretube/build-coretube.sh --arch "$arch" --build-dir /build \
@@ -144,7 +146,6 @@ fetch_git() {
 }
 
 step_sources() {
-  fetch_git "$ce" "$ce_url" "$ce_commit"
   sh "$repo/drm/tools/fetch-tooling.sh" "$work_dir/tooling"
 }
 
@@ -167,7 +168,7 @@ stale_packages() {
 }
 
 step_packages() {
-  [ -d "$ce/scripts" ] || die "no CoreELEC checkout in $ce (run the sources step)"
+  fetch_git "$ce" "$ce_url" "$ce_commit"
   rm -rf "$ce/packages/addons/addon-depends/coretube-depends"
   cp -r "$repo/coreelec/packages" "$ce/packages/addons/addon-depends/coretube-depends"
   ce_env
@@ -194,6 +195,8 @@ step_cobalt() {
   [ "$build_dir" = /build ] || die "the cobalt step needs the build folder at /build; run with --docker"
   export DEPOT_TOOLS_UPDATE=0 DEPOT_TOOLS_METRICS=0 DEPOT_TOOLS_REPORT_BUILD=0 \
     DEPOT_TOOLS_COLLECT_METRICS=0 GCLIENT_SUPPRESS_GIT_VERSION_WARNING=1
+  # depot_tools keeps its caches in HOME; keep them with the checkout this step owns.
+  export HOME=$cobalt_dir/home
   mkdir -p "$HOME"
   [ -d "$cobalt_dir/depot_tools/.git" ] ||
     { git clone -q "$DEPOT_TOOLS_URL" "$cobalt_dir/depot_tools"
@@ -238,9 +241,11 @@ step_zip() {
   done
   grep -q '<font' "$out/fonts/fonts.xml" || die "empty system font package in $out/fonts"
 
-  local stage=$work_dir/$arch/stage d
+  # Stage in a temporary folder: this step may write only out/.
+  local stage d
+  stage=$(mktemp -d)
+  trap 'rm -rf "$stage"' RETURN
   d=$stage/browser.tizentube
-  rm -rf "$stage"
   mkdir -p "$d/lib/gstreamer-1.0" "$d/cobalt/app/cobalt/lib" "$d/drm"
   cp "$repo/addon/addon.xml" "$repo/addon/default.py" "$d/"
   cp -r "$repo/addon/resources" "$repo/addon/bin" "$d/"
@@ -315,11 +320,11 @@ if [ "$mode" = test ]; then run_tests; exit; fi
 steps=${only:-$all_steps}
 if [ "$dry_run" = 1 ]; then
   echo "arch $arch: CoreELEC $ce_device $ce_url @ ${ce_commit:0:12}, image $image"
-  echo "step sources: CoreELEC checkout $ce, helper tooling $work_dir/tooling"
-  echo "step packages: $packages into $ce_build (stamps checked; --allow-rebuild=$allow_rebuild)"
-  echo "step cobalt: $src at ${COBALT_COMMIT:0:12} + cobalt/patches, $platform qa (engine: ${platform}, $stock${legacy:+ or $legacy})"
-  echo "step helper: $work_dir/$arch/android-drm-helper"
-  echo "step zip: $zip_file"
+  echo "step sources: helper tooling (writes $work_dir/tooling)"
+  echo "step packages: CoreELEC checkout $ce, $packages into $ce_build, stamps checked, --allow-rebuild=$allow_rebuild (writes $build_dir)"
+  echo "step cobalt: $src at ${COBALT_COMMIT:0:12} + cobalt/patches, $platform qa, engine from $platform, $stock${legacy:+ or $legacy} (writes $cobalt_dir)"
+  echo "step helper: android-drm-helper (writes $work_dir/$arch)"
+  echo "step zip: $zip_file (writes $repo/out)"
   echo "jobs: $jobs"
   exit 0
 fi

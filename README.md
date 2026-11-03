@@ -30,7 +30,7 @@ Use `--arch aarch64` for the 64-bit add-on, with its own build folder. The zip l
 
 The build runs five steps in order: `sources`, `packages`, `cobalt`, `helper` and `zip`. Run one of them with `--only STEP`. See every option with `./build-coretube.sh --help`.
 
-The CoreELEC build folder may already hold other CoreELEC work. CoreTube adds its own `coretube-*` packages and reuses the rest. If a package in the folder was built from different sources, the build stops and lists it instead of replacing it. Do not run another CoreELEC build in the same folder at the same time.
+The CoreELEC build folder may already hold other CoreELEC work. CoreTube adds its own `coretube-*` packages and reuses the rest. It keeps its CoreELEC source copy in a `coretube` folder inside the build folder. If a package in the folder was built from different sources, the build stops and lists it instead of replacing it. Do not run another CoreELEC build in the same folder at the same time.
 
 ## Install
 

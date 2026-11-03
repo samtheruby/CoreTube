@@ -42,6 +42,16 @@ for want in coretube-no build.CoreELEC-Amlogic-no.aarch64-22 evergreen-arm64-cor
 done
 [ ! -e "$tmp/work" ] || fail "--dry-run created the work folder"
 
+# With --docker each step runs as the owner of one folder, so it may write only there.
+for pair in "sources:$tmp/work" "packages:$tmp/build" "cobalt:$tmp/cobalt" "helper:$tmp/work" "zip:$repo/out"; do
+  step=${pair%%:*} dir=${pair#*:}
+  writes=$(echo "$out" | sed -n "s/^step $step:.*(writes \(.*\))\$/\1/p")
+  [ -n "$writes" ] || fail "$step does not say what it writes: $out"
+  for w in $writes; do
+    case $w in "$dir" | "$dir"/*) ;; *) fail "$step writes $w, outside $dir" ;; esac
+  done
+done
+
 # Default parallel jobs: 75% of the CPUs, at least one.
 want=$(( $(nproc) * 3 / 4 )); [ "$want" -ge 1 ] || want=1
 echo "$out" | grep -qx "jobs: $want" || fail "default jobs not $want: $out"
