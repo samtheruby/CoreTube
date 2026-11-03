@@ -1,0 +1,76 @@
+# Kodi Media Center language file
+# Addon Name: TizenTube
+# Addon id: browser.tizentube
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Language: en_GB\n"
+
+msgctxt "#30000"
+msgid "Display"
+msgstr ""
+
+msgctxt "#30001"
+msgid "Maximum video resolution"
+msgstr ""
+
+msgctxt "#30002"
+msgid "YouTube offers videos up to this resolution. Auto uses the resolution the TV runs at when TizenTube starts."
+msgstr ""
+
+msgctxt "#30003"
+msgid "Auto (current display mode)"
+msgstr ""
+
+msgctxt "#30004"
+msgid "2160p (4K)"
+msgstr ""
+
+msgctxt "#30005"
+msgid "1440p"
+msgstr ""
+
+msgctxt "#30006"
+msgid "1080p"
+msgstr ""
+
+msgctxt "#30007"
+msgid "720p"
+msgstr ""
+
+msgctxt "#30010"
+msgid "Auto frame rate"
+msgstr ""
+
+msgctxt "#30011"
+msgid "Display modes to switch to"
+msgstr ""
+
+msgctxt "#30012"
+msgid "When auto frame rate is on in TizenTube's settings, the TV switches to the refresh rate of the video, using only these modes at the current resolution."
+msgstr ""
+
+msgctxt "#30013"
+msgid "Kodi's whitelist (Settings > System > Display)"
+msgstr ""
+
+msgctxt "#30014"
+msgid "Custom"
+msgstr ""
+
+msgctxt "#30015"
+msgid "Custom display modes"
+msgstr ""
+
+msgctxt "#30016"
+msgid "Display modes TizenTube may switch to, such as 2160p24hz. 24, 30 and 60 Hz modes also cover 23.976, 29.97 and 59.94 Hz."
+msgstr ""
+
+msgctxt "#30017"
+msgid "Choose custom display modes..."
+msgstr ""
+
+msgctxt "#30018"
+msgid "Display modes for auto frame rate"
+msgstr ""

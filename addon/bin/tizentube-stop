@@ -1,0 +1,13 @@
+#!/bin/sh
+
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026-present Team CoreELEC (https://coreelec.org)
+
+# Runs after Cobalt ends, before Kodi starts again (see default.py). The video
+# sink mutes the HDMI output while a video starts; if Cobalt crashed in that
+# moment, the mute is still on and Kodi would come back to a black screen.
+mute=/sys/class/amhdmitx/amhdmitx0/vid_mute
+if [ -w "${mute}" ] && [ "$(cat "${mute}")" != 0 ]; then
+  echo 0 > "${mute}"
+fi
+exit 0

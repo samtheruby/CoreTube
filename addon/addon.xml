@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<addon id="browser.tizentube"
+       name="TizenTube"
+       version="0.5.1"
+       provider-name="TizenTube Cobalt, CoreELEC port">
+  <requires>
+    <import addon="xbmc.python" version="3.0.0"/>
+  </requires>
+  <extension point="xbmc.python.script" library="default.py">
+    <provides>video</provides>
+  </extension>
+  <extension point="xbmc.addon.metadata">
+    <summary>YouTube TV app (TizenTube Cobalt)</summary>
+    <description>
+TizenTube on Cobalt for Amlogic devices: the YouTube TV app with TizenTube's ad blocking and SponsorBlock, drawn with the Mali GPU. Kodi stops while it runs and comes back when it exits.
+    </description>
+    <license>BSD-3-Clause</license>
+    <platform>linux</platform>
+    <assets>
+      <icon>resources/icon.png</icon>
+    </assets>
+  </extension>
+</addon>

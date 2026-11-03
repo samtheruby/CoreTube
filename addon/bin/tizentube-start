@@ -1,0 +1,130 @@
+#!/bin/sh
+
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026-present Team CoreELEC (https://coreelec.org)
+
+# Runs inside the transient unit tizentube (see default.py). Same steps as the
+# WebKit add-on's webkit-start. Optional overrides go in $ADDON_HOME/env, e.g.
+# TIZENTUBE_ARGS (extra Cobalt switches) and TIZENTUBE_USER_AGENT (the user
+# agent sent to YouTube, which decides the streams it serves).
+
+. /etc/profile
+oe_setup_addon browser.tizentube
+
+TIZENTUBE_ARGS=""
+TIZENTUBE_USER_AGENT=""
+[ -e "${ADDON_HOME}/env" ] && . "${ADDON_HOME}/env"
+
+# zip packaging drops the executable bits
+chmod +x "${ADDON_DIR}"/bin/* "${ADDON_DIR}/cobalt/cobalt"
+
+export LD_LIBRARY_PATH="${ADDON_DIR}/lib"
+# Only the add-on's GStreamer plugins, never any an image may ship.
+export GST_PLUGIN_SYSTEM_PATH="${ADDON_DIR}/lib/gstreamer-1.0"
+export GST_PLUGIN_SCANNER="${ADDON_DIR}/bin/gst-plugin-scanner"
+export GST_REGISTRY="${ADDON_HOME}/gst-registry.bin"
+# amlvideosink takes the codecs the decoder lists in vcodec_profile, and the
+# registry caches that list: rebuild it when the list changes (kernel update).
+vcodec_profile="$(cat /sys/class/amstream/vcodec_profile 2>/dev/null)"
+if [ "${vcodec_profile}" != "$(cat "${ADDON_HOME}/vcodec_profile" 2>/dev/null)" ]; then
+  rm -f "${GST_REGISTRY}"
+  printf '%s\n' "${vcodec_profile}" > "${ADDON_HOME}/vcodec_profile"
+fi
+
+# Sound goes to Kodi's audio device. When Kodi uses ALSA, PulseAudio has only a
+# dummy output and ALSA's default is not HDMI, so make Kodi's device the default.
+# When Kodi uses PulseAudio (e.g. Bluetooth), Cobalt uses it too.
+kodi_audio=$(sed -n 's|.*<setting id="audiooutput.audiodevice"[^>]*>ALSA:\([^|<]*\).*|\1|p' \
+  "${HOME}/.kodi/userdata/guisettings.xml" 2>/dev/null)
+if [ -n "${kodi_audio}" ] && [ "${kodi_audio}" != "default" ]; then
+  printf '%s\n' '</usr/share/alsa/alsa.conf>' \
+    "pcm.!default { type plug slave.pcm \"${kodi_audio}\" }" > "${ADDON_HOME}/asound.conf"
+  export ALSA_CONFIG_PATH="${ADDON_HOME}/asound.conf"
+  export GST_PLUGIN_FEATURE_RANK="pulsesink:NONE"
+fi
+
+# Passthrough as Kodi's settings say: AC3/E-AC3 go out as a bitstream on the
+# passthrough device ("hdmi" or "iec958", the base name of Kodi's ALSA device).
+kodi_setting() {
+  sed -n "s|.*<setting id=\"$1\"[^>]*>\([^<]*\)<.*|\1|p" "${HOME}/.kodi/userdata/guisettings.xml" 2>/dev/null
+}
+export TIZENTUBE_PASSTHROUGH=""
+export TIZENTUBE_PASSTHROUGH_DEVICE=""
+case "$(kodi_setting audiooutput.passthroughdevice)" in
+  ALSA:hdmi:*) TIZENTUBE_PASSTHROUGH_DEVICE=hdmi ;;
+  ALSA:iec958:*|ALSA:spdif:*) TIZENTUBE_PASSTHROUGH_DEVICE=iec958 ;;
+esac
+if [ "$(kodi_setting audiooutput.passthrough)" = true ] && [ -n "${TIZENTUBE_PASSTHROUGH_DEVICE}" ]; then
+  [ "$(kodi_setting audiooutput.ac3passthrough)" = true ] && TIZENTUBE_PASSTHROUGH="ac3"
+  [ "$(kodi_setting audiooutput.eac3passthrough)" = true ] && TIZENTUBE_PASSTHROUGH="${TIZENTUBE_PASSTHROUGH} eac3"
+fi
+
+systemctl stop kodi
+
+# Some kernels report ALSA pause but never play on after it. Test it once while
+# the device is free; if it fails, GStreamer stops and restarts the device instead.
+audio_pause="hardware"
+if [ -n "${ALSA_CONFIG_PATH}" ] && ! python3 "${ADDON_DIR}/bin/pause-test.py"; then
+  export GST_ALSASINK_NO_HW_PAUSE=1
+  audio_pause="stop and restart"
+fi
+
+# Screen size: the scaler's output window if Kodi left the scaler on, else the
+# framebuffer size. In a function so `set --` stays local.
+fb=/sys/class/graphics/fb0
+if [ -e "${fb}/free_scale" ]; then
+screen_size() {
+  set -- $(fbset | sed -n 's/^[[:space:]]*geometry //p')
+  w=$1
+  h=$2
+  case "$(cat ${fb}/free_scale)" in
+    *0x10001*)
+      set -- $(cat ${fb}/window_axis)
+      w=$(($3 + 1))
+      h=$(($4 + 1))
+      ;;
+  esac
+  echo "${w} ${h}"
+}
+read -r screen_w screen_h <<EOF
+$(screen_size)
+EOF
+
+# The app lays out at the screen's size, at most 1080 lines high (like Kodi's
+# GUI); the scaler fills the screen.
+page_h=$((screen_h < 1080 ? screen_h : 1080))
+page_w=$((screen_w * page_h / screen_h))
+
+# Cobalt draws into the top-left corner of the framebuffer; scale that corner to
+# the screen, as Kodi's aml_enable_freeScale does. Kodi resets it on start.
+echo 0 > ${fb}/free_scale
+echo "0 0 $((page_w - 1)) $((page_h - 1))" > ${fb}/free_scale_axis
+echo "0 0 $((screen_w - 1)) $((screen_h - 1))" > ${fb}/window_axis
+echo 0x10001 > ${fb}/free_scale
+echo 0 > ${fb}/blank
+# Cobalt's window takes fb0's size; size it to the page, with two buffers.
+# TIZENTUBE_FB_BUFFERS=1 in $ADDON_HOME/env falls back to one buffer (tears, but
+# never shows a stale frame) should two-buffer flicker come back.
+python3 "${ADDON_DIR}/bin/fb-resize.py" ${page_w} ${page_h} ${TIZENTUBE_FB_BUFFERS:-2}
+graphics="framebuffer ${screen_w}x${screen_h}, page ${page_w}x${page_h}"
+else
+  graphics="GBM/DRM (native display mode)"
+  # shortcut: GBM uses the current DRM mode; add DRM mode changes before AFR.
+  export TIZENTUBE_DISPLAY_MODES=""
+fi
+
+# Cobalt keeps cookies and settings under $HOME/.cobalt_storage. Android DRM
+# keeps its own provisioned profile under $HOME/android-drm.
+export HOME="${ADDON_HOME}"
+# Keep the previous session's log for troubleshooting.
+[ -e "${ADDON_LOG_FILE}" ] && mv -f "${ADDON_LOG_FILE}" "${ADDON_LOG_FILE}.old"
+{
+  echo "graphics: ${graphics}, audio pause: ${audio_pause}"
+  echo "max video height: ${TIZENTUBE_MAX_VIDEO_HEIGHT:-display}, auto frame rate modes: ${TIZENTUBE_DISPLAY_MODES:-none}"
+  echo "user agent: ${TIZENTUBE_USER_AGENT:-Cobalt default}"
+  echo "passthrough: ${TIZENTUBE_PASSTHROUGH:-off}${TIZENTUBE_PASSTHROUGH:+ to ${TIZENTUBE_PASSTHROUGH_DEVICE}}"
+  # The user agent holds spaces and ';', so it goes over as one argument.
+  export ADDON_DIR
+  exec python3 "${ADDON_DIR}/bin/android-drm-run.py" "${ADDON_DIR}/cobalt/cobalt" --evergreen_lite \
+    ${TIZENTUBE_USER_AGENT:+"--tizentube-user-agent=${TIZENTUBE_USER_AGENT}"} ${TIZENTUBE_ARGS}
+} > "${ADDON_LOG_FILE}" 2>&1
