@@ -1,0 +1,37 @@
+From 110a63132f7a2ef99c922fa7730923c007420811 Mon Sep 17 00:00:00 2001
+From: samtheruby <peasea1012@gmail.com>
+Date: Tue, 3 Nov 2026 17:24:22 +0000
+Subject: [PATCH] fix(coreelec): seek properly when a video starts at a later
+ position
+
+A new player that starts past 0 (a long skip, a resumed video) changed the
+initial segment with gst_base_src_new_segment(), but GStreamer 1.28's appsrc
+sends its own default segment (start 0) before the first buffer. The video
+sink then held the keyframe until the clock reached its time: a black screen
+and endless loading for the length of the skip. Use the delayed flushing seek
+instead, the path that ordinary seeks take.
+---
+ .../starboard/rdk/shared/player/player_internal.cc         | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/player/player_internal.cc b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/player/player_internal.cc
+index 87742f76bc2..cd2badbb511 100644
+--- a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/player/player_internal.cc
++++ b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/player/player_internal.cc
+@@ -2808,6 +2808,13 @@ void PlayerImpl::HandleInititialSeek() {
+ #if GST_CHECK_VERSION(1, 18, 0)
+   // Replace initial segment if app hasn't written any data yet
+   bool can_change_segment = !audio_caps_ && !video_caps_;
++#if defined(COREELEC)
++  // CoreTube's appsrc (GStreamer 1.28) sends its own default segment (start 0)
++  // before the first buffer, so a segment set with gst_base_src_new_segment()
++  // never reaches the sinks: the video sink then waits for the clock to reach
++  // the target before showing anything. The delayed (flushing) seek works.
++  can_change_segment = false;
++#endif
+   if (can_change_segment) {
+     GST_INFO_OBJECT(pipeline_, "Changing initial segment.");
+     GstClockTime position = seek_position_;
+-- 
+2.47.3
+
