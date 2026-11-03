@@ -36,6 +36,8 @@ The CoreELEC build folder may already hold other CoreELEC work. CoreTube adds it
 
 In Kodi, open **Add-ons**, choose **Install from zip file**, and pick the zip. Then open TizenTube from **Add-ons**. Kodi comes back when you exit TizenTube.
 
+Auto frame rate changes the TV's display mode only for fullscreen videos. Preview cards do not trigger mode changes.
+
 ## Tests
 
 ```sh
