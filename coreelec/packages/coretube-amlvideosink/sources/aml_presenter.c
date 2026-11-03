@@ -73,13 +73,13 @@ static gboolean present(AmlPresenter *p, gboolean vsync, gint64 running)
 {
   AmlFrame frames[AML_PACER_MAX_FRAMES];
   AmlPick pick = {.show = -1};
-  gboolean first = FALSE;
+  gboolean first = FALSE, pacing = p->playing && running >= 0;
   guint kept = 0;
 
   for (guint i = 0; i < p->n_held; i++)
     frames[i] = (AmlFrame){p->held[i].index, p->held[i].running_us};
 
-  if (p->playing && running >= 0 && p->n_held) {
+  if (pacing && p->n_held) {
     gint64 vsync = aml_pacer_vsync_us(p->intervals, p->n_intervals);
 
     pick = aml_pacer_pick(frames, p->n_held, running + vsync, vsync);
@@ -105,8 +105,8 @@ static gboolean present(AmlPresenter *p, gboolean vsync, gint64 running)
       p->held[kept++] = p->held[i];
   }
   p->n_held = kept;
-  /* A vsync without a new frame repeats the one on screen. */
-  if (pick.show < 0 && vsync && p->shown_since_start)
+  /* While playing, a vsync without a new frame repeats the one on screen. */
+  if (pick.show < 0 && vsync && pacing && p->shown_since_start)
     p->repeated++;
   if (pick.show >= 0)
     p->shown++;

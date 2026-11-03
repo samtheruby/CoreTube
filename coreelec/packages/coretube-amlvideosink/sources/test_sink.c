@@ -753,6 +753,21 @@ static void test_stats_count_shown_repeated_dropped(void)
   fake_video_free(f);
 }
 
+/* Paused, the frame on screen is a still picture, not a repeat: the counts only
+ * describe playback. */
+static void test_stats_ignore_paused_vsyncs(void)
+{
+  FakeVideo *f = fake_video_new();
+  guint64 shown, repeated, dropped;
+
+  decoded(f, 0, 1);
+  aml_presenter_start(f->presenter);
+  tick(f, 30, TRUE);
+  aml_presenter_get_stats(f->presenter, &shown, &repeated, &dropped);
+  assert(shown == 1 && repeated == 0 && dropped == 0);
+  fake_video_free(f);
+}
+
 /* End of stream waits for the last frame on screen, or gives up at the timeout. */
 static void test_wait_shown(void)
 {
@@ -868,6 +883,7 @@ int main(void)
   test_wait_shown();
   test_wait_shown_counts_dropped_frames();
   test_stats_count_shown_repeated_dropped();
+  test_stats_ignore_paused_vsyncs();
   g_print("all sink tests passed\n");
   return 0;
 }
