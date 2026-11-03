@@ -52,6 +52,9 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# test mode may run without --arch.
+tag="" image="" ce_url="" ce_commit="" ce_device="" ce_subdir="" triple="" cc_flags=""
+platform="" stock="" sysroot_arch="" legacy=""
 case $arch in
   arm)
     tag=ng image=coretube-ng ce_url=$COREELEC_NG_URL ce_commit=$COREELEC_NG_COMMIT
