@@ -1,0 +1,340 @@
+From 9e4534dd5fdea07ff6b74755ef117a31ecc0753b Mon Sep 17 00:00:00 2001
+From: samtheruby <peasea1012@gmail.com>
+Date: Tue, 3 Nov 2026 17:27:58 +0000
+Subject: [PATCH] fix(coreelec): no green flash or back-and-forth on refresh
+ rate switches
+
+Switching the HDMI mode with the video already on screen flashed green, and
+returning to the normal rate between two videos switched the TV twice (each
+switch blanks it). Mute HDMI video from just before a switch until a second
+after it, asked for again once the mode is set, and go back to the normal rate
+only after five seconds without a video, which the next video cancels.
+---
+ .../coreelec/tests/coreelec_display_test.cc   |  39 +++--
+ .../starboard/rdk/shared/coreelec_display.cc  | 154 ++++++++++++++----
+ .../starboard/rdk/shared/coreelec_display.h   |  22 ++-
+ 3 files changed, 173 insertions(+), 42 deletions(-)
+
+diff --git a/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/tests/coreelec_display_test.cc b/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/tests/coreelec_display_test.cc
+index e924f4b1a4b..264cf2beaa9 100644
+--- a/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/tests/coreelec_display_test.cc
++++ b/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/tests/coreelec_display_test.cc
+@@ -57,23 +57,42 @@ int main() {
+   assert(!ChooseModeSwitch(modes, "1080p60hz", false, caps, 0));
+ 
+   // Frame rate 0 (no video, or a new one coming) goes back to the mode before
+-  // auto frame rate first switched, as Android drops a video surface's rate.
++  // auto frame rate first switched, as Android drops a video surface's rate,
++  // but only after kRestoreDelay: the next video usually wants the same rate.
++  using namespace std::chrono_literals;
++  const auto t0 = AutoFrameRate::Clock::time_point{};
++  const auto delay = AutoFrameRate::kRestoreDelay;
+   AutoFrameRate afr;
+-  assert(!afr.Choose(modes, "1080p60hz", false, caps, 0));               // nothing to undo
+-  s = afr.Choose(modes, "1080p60hz", false, caps, 24);
++  assert(!afr.Choose(modes, "1080p60hz", false, caps, 0, t0));           // nothing to undo
++  assert(!afr.restore_time());
++  s = afr.Choose(modes, "1080p60hz", false, caps, 24, t0);
+   assert(s && s->name == "1080p24hz" && !s->fractional);
+-  s = afr.Choose(modes, "1080p24hz", false, caps, 23.976);
++  s = afr.Choose(modes, "1080p24hz", false, caps, 23.976, t0);
+   assert(s && s->name == "1080p24hz" && s->fractional);
+-  s = afr.Choose(modes, "1080p24hz", true, caps, 0);
++  assert(!afr.Choose(modes, "1080p24hz", true, caps, 0, t0));            // no switch yet
++  assert(afr.restore_time() == t0 + delay);
++  assert(!afr.Restore("1080p24hz", true, t0 + delay - 1s));              // not due
++  // The next video, at the same rate, before the delay ends: no switch at all.
++  assert(!afr.Choose(modes, "1080p24hz", true, caps, 23.976, t0 + 2s));
++  assert(!afr.restore_time());
++  assert(!afr.Restore("1080p24hz", true, t0 + 2 * delay));               // cancelled
++  // No video for the whole delay: back to 60 Hz.
++  assert(!afr.Choose(modes, "1080p24hz", true, caps, 0, t0 + 3s));
++  s = afr.Restore("1080p24hz", true, t0 + 3s + delay);
+   assert(s && s->name == "1080p60hz" && !s->fractional && s->suffix.empty());
+-  assert(!afr.Choose(modes, "1080p60hz", false, caps, 0));               // already back
+-  s = afr.Choose(modes, "1080p59hz", false, caps, 0);
+-  assert(!s);                                                            // nothing left to undo
++  assert(!afr.restore_time());
++  assert(!afr.Choose(modes, "1080p60hz", false, caps, 0, t0 + 20s));     // nothing left to undo
++  assert(!afr.restore_time());
+   // A 59.94 Hz start, kept with its suffix.
+-  s = afr.Choose(modes, "1080p60hz420", true, caps, 24);
++  s = afr.Choose(modes, "1080p60hz420", true, caps, 24, t0);
+   assert(s && s->name == "1080p24hz");
+-  s = afr.Choose(modes, "1080p24hz420", false, caps, 0);
++  afr.Choose(modes, "1080p24hz420", false, caps, 0, t0);
++  s = afr.Restore("1080p24hz420", false, t0 + delay);
+   assert(s && s->name == "1080p60hz" && s->fractional && s->suffix == "420");
++  // Someone else already put the original mode back: nothing to switch.
++  afr.Choose(modes, "1080p60hz", false, caps, 24, t0);
++  afr.Choose(modes, "1080p24hz", false, caps, 0, t0);
++  assert(!afr.Restore("1080p60hz", false, t0 + delay));
+ 
+   // The mode for a WxH picture after the display changed (hotplug, another TV).
+   std::vector<OutputMode> outputs = {
+diff --git a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.cc b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.cc
+index 891e86d6b52..26e0b650c96 100644
+--- a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.cc
++++ b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.cc
+@@ -4,12 +4,14 @@
+ #include "third_party/starboard/rdk/shared/coreelec_display.h"
+ 
+ #include <cmath>
++#include <condition_variable>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <fstream>
+ #include <mutex>
+ #include <regex>
+ #include <sstream>
++#include <thread>
+ 
+ #include "starboard/common/log.h"
+ #include "starboard/extension/tizentube_display.h"
+@@ -21,6 +23,9 @@ constexpr char kModePath[] = "/sys/class/display/mode";
+ constexpr char kDisplayCapsPath[] = "/sys/class/amhdmitx/amhdmitx0/disp_cap";
+ constexpr char kHdrCapsPath[] = "/sys/class/amhdmitx/amhdmitx0/hdr_cap";
+ constexpr char kFracRatePath[] = "/sys/class/amhdmitx/amhdmitx0/frac_rate_policy";
++constexpr char kVideoMutePath[] = "/sys/class/amhdmitx/amhdmitx0/vid_mute";
++// How long HDMI video stays muted after a refresh rate switch.
++constexpr auto kSwitchMute = std::chrono::seconds(1);
+ 
+ // The whole file, without trailing white space; empty when it cannot be read.
+ std::string ReadFile(const char* path) {
+@@ -62,41 +67,115 @@ bool DisplayTakes(const std::string& display_caps, const std::string& name) {
+ 
+ std::mutex g_setter_mutex;
+ ModeSetter g_setter;
+-std::mutex g_frame_rate_mutex;  // one switch at a time; guards g_frame_rate
++
++// Auto frame rate's state; the mutex also makes switches one at a time. A
++// thread does the timed work: the return to the original mode and the unmute.
++std::mutex g_frame_rate_mutex;
++std::condition_variable g_frame_rate_wake;
+ AutoFrameRate g_frame_rate;
++std::optional<AutoFrameRate::Clock::time_point> g_unmute_at;
++int g_mutes = 0;  // vid_mute counts requests: one "0" is owed for each "1" written
+ 
+-void SetFrameRate(float frame_rate) {
+-  std::lock_guard<std::mutex> switching(g_frame_rate_mutex);
+-  const char* allowed = getenv("TIZENTUBE_DISPLAY_MODES");
+-  std::string why;
+-  auto target = g_frame_rate.Choose(allowed ? allowed : "", ReadFile(kModePath),
+-                                    ReadFile(kFracRatePath) == "1",
+-                                    ReadFile(kDisplayCapsPath), frame_rate, &why);
+-  if (!target) {
+-    if (!why.empty()) {
+-      SB_LOG(INFO) << "Auto frame rate: " << why;
+-    }
+-    return;
+-  }
+-  if (frame_rate > 0) {
+-    SB_LOG(INFO) << "Auto frame rate: " << frame_rate << " fps, switching to "
+-                 << target->name << (target->fractional ? " (1000/1001)" : "");
+-  } else {
+-    SB_LOG(INFO) << "Auto frame rate: no video, back to " << target->name
+-                 << (target->fractional ? " (1000/1001)" : "");
++// Called with g_frame_rate_mutex held.
++void Unmute() {
++  for (; g_mutes > 0; g_mutes--) {
++    WriteFile(kVideoMutePath, "0");
+   }
++  g_unmute_at.reset();
++}
++
++// Called with g_frame_rate_mutex held. The first frames of a new mode flash
++// green on the video layer, so HDMI video stays muted until kSwitchMute after
++// the switch (pannal's Kodi never changes the mode with video on screen). The
++// mute is applied at a vsync and the switch resets the HDMI block, so it is
++// asked for again once the mode is set.
++void Switch(const ModeSwitch& target) {
+   ModeSetter setter;
+   {
+     std::lock_guard<std::mutex> lock(g_setter_mutex);
+     setter = g_setter;
+   }
++  g_mutes += WriteFile(kVideoMutePath, "1");
+   if (setter) {
+-    if (!setter(*target)) {
+-      SB_LOG(WARNING) << "Auto frame rate: the display cannot switch to " << target->name;
++    if (!setter(target)) {
++      SB_LOG(WARNING) << "Auto frame rate: the display cannot switch to " << target.name;
++    }
++  } else if (WriteFile(kFracRatePath, target.fractional ? "1" : "0")) {
++    WriteFile(kModePath, target.name + target.suffix);
++  }
++  g_mutes += WriteFile(kVideoMutePath, "1");
++  g_unmute_at = AutoFrameRate::Clock::now() + kSwitchMute;
++}
++
++class FrameRateThread {
++ public:
++  // Called with g_frame_rate_mutex held.
++  void Start() {
++    if (!thread_.joinable()) {
++      thread_ = std::thread(&FrameRateThread::Run, this);
++    }
++  }
++  ~FrameRateThread() {
++    {
++      std::lock_guard<std::mutex> lock(g_frame_rate_mutex);
++      stop_ = true;
++    }
++    g_frame_rate_wake.notify_all();
++    if (thread_.joinable()) {
++      thread_.join();
++    }
++    Unmute();
++  }
++
++ private:
++  void Run() {
++    std::unique_lock<std::mutex> lock(g_frame_rate_mutex);
++    while (!stop_) {
++      auto next = g_frame_rate.restore_time();
++      if (g_unmute_at && (!next || *g_unmute_at < *next)) {
++        next = g_unmute_at;
++      }
++      if (!next) {
++        g_frame_rate_wake.wait(lock);
++        continue;
++      }
++      g_frame_rate_wake.wait_until(lock, *next);
++      auto now = AutoFrameRate::Clock::now();
++      if (g_unmute_at && now >= *g_unmute_at) {
++        Unmute();
++      }
++      auto back = g_frame_rate.Restore(ReadFile(kModePath),
++                                       ReadFile(kFracRatePath) == "1", now);
++      if (back) {
++        SB_LOG(INFO) << "Auto frame rate: no video, back to " << back->name
++                     << (back->fractional ? " (1000/1001)" : "");
++        Switch(*back);
++      }
+     }
+-  } else if (WriteFile(kFracRatePath, target->fractional ? "1" : "0")) {
+-    WriteFile(kModePath, target->name + target->suffix);
+   }
++
++  std::thread thread_;
++  bool stop_ = false;
++};
++FrameRateThread g_frame_rate_thread;
++
++void SetFrameRate(float frame_rate) {
++  std::lock_guard<std::mutex> lock(g_frame_rate_mutex);
++  const char* allowed = getenv("TIZENTUBE_DISPLAY_MODES");
++  std::string why;
++  auto target = g_frame_rate.Choose(allowed ? allowed : "", ReadFile(kModePath),
++                                    ReadFile(kFracRatePath) == "1",
++                                    ReadFile(kDisplayCapsPath), frame_rate,
++                                    AutoFrameRate::Clock::now(), &why);
++  if (target) {
++    SB_LOG(INFO) << "Auto frame rate: " << frame_rate << " fps, switching to "
++                 << target->name << (target->fractional ? " (1000/1001)" : "");
++    Switch(*target);
++  } else if (!why.empty()) {
++    SB_LOG(INFO) << "Auto frame rate: " << why;
++  }
++  g_frame_rate_thread.Start();
++  g_frame_rate_wake.notify_all();
+ }
+ 
+ const TizenTubeExtensionDisplayApi kDisplayApi = {
+@@ -306,16 +385,15 @@ std::optional<ModeSwitch> AutoFrameRate::Choose(const std::string& allowed,
+                                                 bool current_fractional,
+                                                 const std::string& display_caps,
+                                                 double frame_rate,
++                                                Clock::time_point now,
+                                                 std::string* why) {
+   if (!(frame_rate > 0)) {
+-    std::optional<ModeSwitch> back = std::move(original_);
+-    original_.reset();
+-    if (back && current == back->name + back->suffix &&
+-        current_fractional == back->fractional) {
+-      return std::nullopt;
++    if (original_ && !restore_at_) {
++      restore_at_ = now + kRestoreDelay;
+     }
+-    return back;
++    return std::nullopt;
+   }
++  restore_at_.reset();
+   auto target = ChooseModeSwitch(allowed, current, current_fractional,
+                                  display_caps, frame_rate, why);
+   auto mode = ParseMode(current);
+@@ -326,6 +404,22 @@ std::optional<ModeSwitch> AutoFrameRate::Choose(const std::string& allowed,
+   return target;
+ }
+ 
++std::optional<ModeSwitch> AutoFrameRate::Restore(const std::string& current,
++                                                 bool current_fractional,
++                                                 Clock::time_point now) {
++  if (!restore_at_ || now < *restore_at_) {
++    return std::nullopt;
++  }
++  restore_at_.reset();
++  std::optional<ModeSwitch> back = std::move(original_);
++  original_.reset();
++  if (back && current == back->name + back->suffix &&
++      current_fractional == back->fractional) {
++    return std::nullopt;
++  }
++  return back;
++}
++
+ void ResetFrameRate() {
+   SetFrameRate(0);
+ }
+diff --git a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.h b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.h
+index 414bbf527d9..0e40ef43f47 100644
+--- a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.h
++++ b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.h
+@@ -7,6 +7,7 @@
+ #ifndef THIRD_PARTY_STARBOARD_RDK_SHARED_COREELEC_DISPLAY_H_
+ #define THIRD_PARTY_STARBOARD_RDK_SHARED_COREELEC_DISPLAY_H_
+ 
++#include <chrono>
+ #include <functional>
+ #include <memory>
+ #include <optional>
+@@ -70,17 +71,34 @@ std::optional<ModeSwitch> ChooseModeSwitch(const std::string& allowed,
+ // Auto frame rate across videos: remembers the mode it first switched away from.
+ class AutoFrameRate {
+  public:
+-  // The switch for |frame_rate| (see ChooseModeSwitch). A |frame_rate| of 0 or
+-  // less means no video wants a rate: back to the mode before the first switch.
++  using Clock = std::chrono::steady_clock;
++  // How long the display keeps a video's rate once no video wants one: the next
++  // video usually wants the same rate, and each switch blanks the TV.
++  static constexpr std::chrono::seconds kRestoreDelay{5};
++
++  // The switch for |frame_rate| (see ChooseModeSwitch); it cancels a pending
++  // return. A |frame_rate| of 0 or less means no video wants a rate: the return
++  // to the mode before the first switch is due kRestoreDelay after |now|.
+   std::optional<ModeSwitch> Choose(const std::string& allowed,
+                                    const std::string& current,
+                                    bool current_fractional,
+                                    const std::string& display_caps,
+                                    double frame_rate,
++                                   Clock::time_point now,
+                                    std::string* why = nullptr);
+ 
++  // When the return is due; empty when none is pending.
++  std::optional<Clock::time_point> restore_time() const { return restore_at_; }
++
++  // The return to the original mode, once |now| reaches restore_time(). Empty
++  // when it is not due, or the display already shows the original mode.
++  std::optional<ModeSwitch> Restore(const std::string& current,
++                                    bool current_fractional,
++                                    Clock::time_point now);
++
+  private:
+   std::optional<ModeSwitch> original_;
++  std::optional<Clock::time_point> restore_at_;
+ };
+ 
+ // Auto frame rate with nothing playing: the display goes back to its mode from
+-- 
+2.47.3
+
