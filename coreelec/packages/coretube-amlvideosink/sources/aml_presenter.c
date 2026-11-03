@@ -51,8 +51,11 @@ static gint64 frame_running_us(AmlPresenter *p, guint64 pts_us)
     stream = (pts_us - 1) * GST_USECOND;
   else
     stream = GST_CLOCK_TIME_IS_VALID(p->last_stream) ? p->last_stream : p->segment.start;
+  /* Checked in as whole us, a frame at the segment start may land up to 1 us before it. */
+  if (stream < p->segment.start && p->segment.start - stream < GST_USECOND)
+    stream = p->segment.start;
   p->last_stream = stream;
-  sign = gst_segment_to_running_time_full(&p->segment, GST_FORMAT_TIME, stream, &running);
+  sign =gst_segment_to_running_time_full(&p->segment, GST_FORMAT_TIME, stream, &running);
   if (sign > 0)
     return (gint64)(running / GST_USECOND);
   if (sign < 0)
@@ -62,6 +65,8 @@ static gint64 frame_running_us(AmlPresenter *p, guint64 pts_us)
 
 static void hand_back(AmlPresenter *p, const HeldFrame *frame, gboolean drop)
 {
+  GST_LOG("%s buffer %u, pts %" G_GUINT64_FORMAT ", due at %" G_GINT64_FORMAT " us", drop ? "drop" : "show",
+      frame->index, frame->pts_us, frame->running_us);
   if (p->ops->queue(p->ctx, frame->index, drop) < 0)
     GST_WARNING("cannot hand back buffer %u", frame->index);
   p->handled_pts = MAX(p->handled_pts, frame->pts_us);
@@ -83,6 +88,7 @@ static gboolean present(AmlPresenter *p, gboolean vsync, gint64 running)
     gint64 vsync = aml_pacer_vsync_us(p->intervals, p->n_intervals);
 
     pick = aml_pacer_pick(frames, p->n_held, running + vsync, vsync);
+    GST_LOG("vsync at %" G_GINT64_FORMAT " us (period %" G_GINT64_FORMAT "): %u held", running, vsync, p->n_held);
   } else if (!p->shown_since_start) {
     for (guint i = 0; i < p->n_held && pick.show < 0; i++) {
       if (frames[i].running_us < 0)

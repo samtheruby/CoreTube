@@ -768,6 +768,23 @@ static void test_stats_ignore_paused_vsyncs(void)
   fake_video_free(f);
 }
 
+/* Timestamps go to the decoder in whole us. A frame exactly at a segment start that
+ * is not a whole us (an MP4 edit list: 66666666 ns) must not fall before it. */
+static void test_frame_at_segment_start_is_shown(void)
+{
+  FakeVideo *f = fake_video_new();
+  GstSegment segment;
+
+  gst_segment_init(&segment, GST_FORMAT_TIME);
+  segment.start = segment.time = 66666666;
+  aml_presenter_set_segment(f->presenter, &segment);
+  decoded(f, 0, 66666666 / 1000 + 1);
+  aml_presenter_start(f->presenter);
+  tick(f, 1, TRUE);
+  assert(f->n_log == 1 && f->log[0].index == 0 && !f->log[0].drop);
+  fake_video_free(f);
+}
+
 /* End of stream waits for the last frame on screen, or gives up at the timeout. */
 static void test_wait_shown(void)
 {
@@ -884,6 +901,7 @@ int main(void)
   test_wait_shown_counts_dropped_frames();
   test_stats_count_shown_repeated_dropped();
   test_stats_ignore_paused_vsyncs();
+  test_frame_at_segment_start_is_shown();
   g_print("all sink tests passed\n");
   return 0;
 }
