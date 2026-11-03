@@ -46,6 +46,17 @@ echo "$out" | grep -q '^refusing: ' || fail "foreign edit printed: $out"
 grep -qx 'local edit' "$tmp/src/b.txt" || fail "foreign edit was touched"
 g checkout -q b.txt
 
+# A tree that has the earlier patches gets only the new one.
+printf 'two\nmore\n' > "$tmp/src/b.txt"
+g diff -- b.txt > "$tmp/patches/0003-more.patch"
+g checkout -q b.txt
+out=$(run "$pin") || fail "new patch: exit $? ($out)"
+[ "$out" = applied ] || fail "new patch printed: $out"
+grep -qx more "$tmp/src/b.txt" || fail "patch 3 not applied"
+grep -qx 'one changed' "$tmp/src/a.txt" || fail "patch 1 lost"
+out=$(run "$pin") || fail "after new patch: exit $? ($out)"
+[ "$out" = "already applied" ] || fail "after new patch printed: $out"
+
 set +e; out=$(run 0000000000000000000000000000000000000000); rc=$?; set -e
 [ "$rc" -eq 3 ] || fail "wrong pin: exit $rc ($out)"
 echo "$out" | grep -q '^refusing: HEAD' || fail "wrong pin printed: $out"
