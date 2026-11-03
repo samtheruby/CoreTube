@@ -1,0 +1,91 @@
+From 1d29b86b396d2fb255a468ad7fd06c028c933877 Mon Sep 17 00:00:00 2001
+From: samtheruby <peasea1012@gmail.com>
+Date: Tue, 3 Nov 2026 05:49:11 +0000
+Subject: [PATCH 1/2] feat(browser): add --tizentube-user-agent switch
+
+TizenTube's SetUserAgent only reaches the network stack after startup and
+is not kept, and Chromium's --user-agent is compiled out of official
+builds. Launchers (the CoreELEC add-on) need to set the user agent from
+the first request, so read it from a switch of our own first.
+---
+ cobalt/browser/cobalt_content_browser_client.cc |  8 ++++++++
+ .../cobalt_content_browser_client_unittest.cc   | 17 +++++++++++++++++
+ cobalt/browser/switches.h                       |  5 +++++
+ 3 files changed, 30 insertions(+)
+
+diff --git a/cobalt/browser/cobalt_content_browser_client.cc b/cobalt/browser/cobalt_content_browser_client.cc
+index 11e58027801..5c6bf02e90a 100644
+--- a/cobalt/browser/cobalt_content_browser_client.cc
++++ b/cobalt/browser/cobalt_content_browser_client.cc
+@@ -207,6 +207,14 @@ static void JNI_CobaltContentBrowserClient_DispatchFocus(JNIEnv*) {
+ #endif  // BUILDFLAG(IS_ANDROID)
+ 
+ std::string GetCobaltUserAgent() {
++  const auto* command_line = base::CommandLine::ForCurrentProcess();
++  if (command_line->HasSwitch(switches::kTizenTubeUserAgent)) {
++    std::string user_agent =
++        command_line->GetSwitchValueASCII(switches::kTizenTubeUserAgent);
++    if (!user_agent.empty()) {
++      return user_agent;
++    }
++  }
+   if (!CobaltContentBrowserClient::GetUserAgentOverride().empty()) {
+     return CobaltContentBrowserClient::GetUserAgentOverride();
+   }
+diff --git a/cobalt/browser/cobalt_content_browser_client_unittest.cc b/cobalt/browser/cobalt_content_browser_client_unittest.cc
+index ffb35280c31..b80068c599a 100644
+--- a/cobalt/browser/cobalt_content_browser_client_unittest.cc
++++ b/cobalt/browser/cobalt_content_browser_client_unittest.cc
+@@ -18,12 +18,14 @@
+ #include <string>
+ #include <variant>
+ 
++#include "base/command_line.h"
+ #include "base/test/scoped_feature_list.h"
+ #include "base/test/task_environment.h"
+ #include "build/build_config.h"
+ #include "cobalt/browser/client_hint_headers/cobalt_header_value_provider.h"
+ #include "cobalt/browser/features.h"
+ #include "cobalt/browser/global_features.h"
++#include "cobalt/browser/switches.h"
+ #include "content/public/browser/overlay_window.h"
+ #include "mojo/public/cpp/bindings/pending_remote.h"
+ #include "net/base/isolation_info.h"
+@@ -62,6 +64,21 @@ TEST_F(CobaltContentBrowserClientTest, ParseAndApplyH5vccSettingsForTesting) {
+   EXPECT_EQ(std::get<std::string>(it2->second), "Baz");
+ }
+ 
++TEST_F(CobaltContentBrowserClientTest, TizenTubeUserAgentSwitchSetsUserAgent) {
++  constexpr char kUserAgent[] =
++      "Mozilla/5.0 (PS4; Leanback Shell) Cobalt/25.lts.40.1035033; compatible;";
++  auto* command_line = base::CommandLine::ForCurrentProcess();
++  command_line->AppendSwitchASCII(switches::kTizenTubeUserAgent, kUserAgent);
++  CobaltContentBrowserClient client(/*startup_timestamp=*/absl::nullopt,
++                                    /*deep_link=*/"",
++                                    /*is_visible=*/true);
++
++  EXPECT_EQ(client.GetUserAgent(), kUserAgent);
++
++  command_line->RemoveSwitch(switches::kTizenTubeUserAgent);
++  EXPECT_NE(client.GetUserAgent(), kUserAgent);
++}
++
+ TEST_F(CobaltContentBrowserClientTest,
+        CreateWindowForVideoPictureInPicturePlatformBehavior) {
+   CobaltContentBrowserClient client(/*startup_timestamp=*/absl::nullopt,
+diff --git a/cobalt/browser/switches.h b/cobalt/browser/switches.h
+index adbb9cffbde..5d5af39131e 100644
+--- a/cobalt/browser/switches.h
++++ b/cobalt/browser/switches.h
+@@ -39,6 +39,11 @@ constexpr char kWindowSize[] = "window-size";
+ // --enable-h5vcc-settings=Key1=Val1;Key2=Val2
+ constexpr char kEnableH5vccSettings[] = "enable-h5vcc-settings";
+ 
++// The user agent sent from startup on, whole (it may hold spaces and ';'):
++// --tizentube-user-agent="Mozilla/5.0 (...)". Unlike Chromium's --user-agent,
++// official builds honor it.
++constexpr char kTizenTubeUserAgent[] = "tizentube-user-agent";
++
+ }  // namespace switches
+ }  // namespace cobalt
+ 
