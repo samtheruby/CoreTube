@@ -17,5 +17,11 @@ for p in $want; do
   for dep in $(sed -n 's/^PKG_DEPENDS_TARGET="\(.*\)"/\1/p' "$p/package.mk"); do
     case $dep in coretube-*) [ -d "$dep" ] || fail "$p depends on missing $dep" ;; esac
   done
+  # Everything installs under a private prefix, so the image's own GStreamer in
+  # the shared CoreELEC sysroot stays untouched, and finds its siblings there.
+  grep -q '^PKG_MESON_OPTS_TARGET="${CORETUBE_MESON_OPTS}' "$p/package.mk" ||
+    fail "$p does not start PKG_MESON_OPTS_TARGET with CORETUBE_MESON_OPTS"
+  grep -qx '. $(get_pkg_directory coretube-gstreamer)/coretube.mk' "$p/package.mk" ||
+    fail "$p does not include coretube.mk"
 done
 echo "test_package_names: ok"

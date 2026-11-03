@@ -9,8 +9,8 @@ PKG_SITE="https://gstreamer.freedesktop.org"
 PKG_URL="https://gstreamer.freedesktop.org/src/gstreamer/gstreamer-${PKG_VERSION}.tar.xz"
 PKG_DEPENDS_TARGET="toolchain glib"
 PKG_LONGDESC="GStreamer core for the TizenTube add-on (the image's gstreamer has no plugin registry)."
+. $(get_pkg_directory coretube-gstreamer)/coretube.mk
 
-# shortcut: installs into the shared build sysroot, like the image's packages; use a
-# dedicated sysroot before building an image that needs its own stripped GStreamer.
-PKG_MESON_OPTS_TARGET="-Dauto_features=disabled \
+PKG_MESON_OPTS_TARGET="${CORETUBE_MESON_OPTS} \
+                       -Dauto_features=disabled \
                        -Dtools=enabled"

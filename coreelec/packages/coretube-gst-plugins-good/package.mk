@@ -9,10 +9,12 @@ PKG_SITE="https://gstreamer.freedesktop.org"
 PKG_URL="https://gstreamer.freedesktop.org/src/gst-plugins-good/gst-plugins-good-${PKG_VERSION}.tar.xz"
 PKG_DEPENDS_TARGET="toolchain pulseaudio coretube-gst-plugins-base"
 PKG_LONGDESC="GStreamer good plugins for the TizenTube add-on."
+. $(get_pkg_directory coretube-gstreamer)/coretube.mk
 
 # MP4 and WebM demuxers, audio parsers, and automatic audio output (PulseAudio,
 # which also reaches Bluetooth headphones, else ALSA).
-PKG_MESON_OPTS_TARGET="-Dauto_features=disabled \
+PKG_MESON_OPTS_TARGET="${CORETUBE_MESON_OPTS} \
+                       -Dauto_features=disabled \
                        -Daudioparsers=enabled \
                        -Dautodetect=enabled \
                        -Did3demux=enabled \

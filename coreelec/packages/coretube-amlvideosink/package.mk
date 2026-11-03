@@ -9,3 +9,6 @@ PKG_URL=""
 PKG_DEPENDS_TARGET="toolchain libamcodec coretube-gstreamer coretube-gst-plugins-base"
 PKG_LONGDESC="GStreamer video sink for the Amlogic hardware decoder, used by the TizenTube add-on."
 PKG_TOOLCHAIN="meson"
+. $(get_pkg_directory coretube-gstreamer)/coretube.mk
+
+PKG_MESON_OPTS_TARGET="${CORETUBE_MESON_OPTS}"

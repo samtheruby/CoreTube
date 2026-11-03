@@ -9,10 +9,12 @@ PKG_SITE="https://gstreamer.freedesktop.org"
 PKG_URL="https://gstreamer.freedesktop.org/src/gst-plugins-base/gst-plugins-base-${PKG_VERSION}.tar.xz"
 PKG_DEPENDS_TARGET="toolchain alsa-lib coretube-gstreamer"
 PKG_LONGDESC="GStreamer base plugins and libraries for the TizenTube add-on."
+. $(get_pkg_directory coretube-gstreamer)/coretube.mk
 
 # Playback (playbin), ALSA output and the audio converters; video is decoded and
 # shown by the Amlogic hardware, so no video converters or GL.
-PKG_MESON_OPTS_TARGET="-Dauto_features=disabled \
+PKG_MESON_OPTS_TARGET="${CORETUBE_MESON_OPTS} \
+                       -Dauto_features=disabled \
                        -Dalsa=enabled \
                        -Dapp=enabled \
                        -Daudioconvert=enabled \

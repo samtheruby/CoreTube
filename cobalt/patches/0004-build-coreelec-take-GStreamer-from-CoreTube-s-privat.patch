@@ -1,0 +1,126 @@
+From c65c01288a1a40e507f292e429eeaa032b1a0cd4 Mon Sep 17 00:00:00 2001
+From: samtheruby <peasea1012@gmail.com>
+Date: Tue, 3 Nov 2026 08:30:15 +0000
+Subject: [PATCH] build(coreelec): take GStreamer from CoreTube's private
+ prefix
+
+CoreTube's GStreamer packages now install under /usr/lib/coretube in the
+CoreELEC sysroot instead of over the image's GStreamer in /usr. Give the
+CoreELEC platforms a pkg-config wrapper that searches that prefix first,
+and that fails when GStreamer is missing there rather than falling back
+to the image's, whose headers would not match the libraries the add-on
+ships.
+---
+ .../rdk/coreelec/pkg-config-coretube.sh       | 19 ++++++++
+ .../rdk/coreelec/tests/pkg_config_test.sh     | 45 +++++++++++++++++++
+ .../rdk/coreelec/tests/run_host_tests.sh      |  1 +
+ .../third_party/starboard/rdk/shared/BUILD.gn |  9 ++++
+ 4 files changed, 74 insertions(+)
+ create mode 100755 starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/pkg-config-coretube.sh
+ create mode 100755 starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/tests/pkg_config_test.sh
+
+diff --git a/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/pkg-config-coretube.sh b/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/pkg-config-coretube.sh
+new file mode 100755
+index 00000000000..281fb9b8b62
+--- /dev/null
++++ b/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/pkg-config-coretube.sh
+@@ -0,0 +1,19 @@
++#!/bin/sh
++# SPDX-License-Identifier: BSD-3-Clause
++# pkg-config for the CoreELEC platforms. Chromium's pkg-config.py points
++# PKG_CONFIG_LIBDIR at the CoreELEC sysroot; CoreTube's GStreamer sits under a
++# private prefix there (/usr/lib/coretube), so it is searched first. GStreamer
++# must come from there: the add-on ships those libraries, not the image's.
++sysroot=${PKG_CONFIG_LIBDIR%%/usr/lib/pkgconfig*}
++private=${sysroot}/usr/lib/coretube/lib/pkgconfig
++for arg in "$@"; do
++  case $arg in
++    gstreamer-*)
++      if [ ! -e "${private}/${arg}.pc" ]; then
++        echo "pkg-config-coretube: no ${arg} in ${private} (build CoreTube's coretube-* packages first)" >&2
++        exit 1
++      fi
++      ;;
++  esac
++done
++PKG_CONFIG_PATH="${private}${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}" exec pkg-config "$@"
+diff --git a/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/tests/pkg_config_test.sh b/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/tests/pkg_config_test.sh
+new file mode 100755
+index 00000000000..c258f02617d
+--- /dev/null
++++ b/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/tests/pkg_config_test.sh
+@@ -0,0 +1,45 @@
++#!/bin/sh
++# SPDX-License-Identifier: BSD-3-Clause
++# pkg-config-coretube.sh on a fake sysroot: GStreamer comes from CoreTube's
++# private prefix, other packages from the sysroot, and a missing private
++# GStreamer is an error instead of a silent fall back to the image's.
++set -eu
++wrapper=$(cd "$(dirname "$0")/.." && pwd)/pkg-config-coretube.sh
++tmp=$(mktemp -d)
++trap 'rm -rf "$tmp"' EXIT
++fail() { echo "FAIL: $*" >&2; exit 1; }
++s=$tmp/sysroot
++mkdir -p "$s/usr/lib/pkgconfig" "$s/usr/lib/coretube/lib/pkgconfig"
++cat > "$s/usr/lib/pkgconfig/glib-2.0.pc" <<'EOF'
++prefix=/usr
++Name: glib-2.0
++Description: GLib
++Version: 2.80.0
++Cflags: -I${prefix}/include/glib-2.0
++EOF
++cat > "$s/usr/lib/pkgconfig/gstreamer-1.0.pc" <<'EOF'
++prefix=/usr
++Name: gstreamer-1.0
++Description: the image's GStreamer
++Version: 1.24.0
++Cflags: -I${prefix}/include/image-gstreamer
++EOF
++cat > "$s/usr/lib/coretube/lib/pkgconfig/gstreamer-1.0.pc" <<'EOF'
++prefix=/usr/lib/coretube
++Name: gstreamer-1.0
++Description: CoreTube's GStreamer
++Version: 1.28.8
++Requires: glib-2.0
++Cflags: -I${prefix}/include/gstreamer-1.0
++EOF
++pc() { PKG_CONFIG_LIBDIR="$s/usr/lib/pkgconfig:$s/usr/share/pkgconfig" sh "$wrapper" "$@"; }
++
++[ "$(pc --modversion gstreamer-1.0)" = 1.28.8 ] || fail "not CoreTube's GStreamer: $(pc --modversion gstreamer-1.0)"
++out=$(pc --cflags gstreamer-1.0)
++echo "$out" | grep -q -- "-I/usr/lib/coretube/include/gstreamer-1.0" || fail "cflags: $out"
++echo "$out" | grep -q -- "-I/usr/include/glib-2.0" || fail "glib from the sysroot missing: $out"
++[ "$(pc --modversion glib-2.0)" = 2.80.0 ] || fail "glib not found"
++rm "$s/usr/lib/coretube/lib/pkgconfig/gstreamer-1.0.pc"
++if out=$(pc --cflags gstreamer-1.0 2>&1); then fail "fell back to the image's GStreamer: $out"; fi
++echo "$out" | grep -q "build CoreTube's coretube-\* packages first" || fail "unclear error: $out"
++echo "pkg-config wrapper tests passed"
+diff --git a/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/tests/run_host_tests.sh b/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/tests/run_host_tests.sh
+index c87b06c3ddd..a60178023d3 100755
+--- a/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/tests/run_host_tests.sh
++++ b/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/tests/run_host_tests.sh
+@@ -15,3 +15,4 @@ for t in display audio; do
+   c++ $flags -o "$out/coreelec_${t}_test" "$tests/coreelec_${t}_test.cc" "$shared/coreelec_$t.cc" $libs
+   "$out/coreelec_${t}_test"
+ done
++sh "$tests/pkg_config_test.sh"
+diff --git a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/BUILD.gn b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/BUILD.gn
+index 3209680a8dd..b9a8bf7d83f 100644
+--- a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/BUILD.gn
++++ b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/BUILD.gn
+@@ -58,6 +58,15 @@ if (!rdk_build_with_yocto) {
+     current_cpu,
+   ]
+ }
++if (starboard_target_platform == "coreelec-arm" ||
++    starboard_target_platform == "coreelec-arm64") {
++  # CoreTube's GStreamer sits under a private prefix in the CoreELEC sysroot.
++  rdk_pkgconfig_extra_args += [
++    "-p",
++    rebase_path(
++        "//starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/pkg-config-coretube.sh"),
++  ]
++}
+ 
+ if (starboard_target_platform == "coreelec-arm64") {
+   pkg_config("coreelec_drm") {

@@ -9,6 +9,8 @@ PKG_SITE="https://gstreamer.freedesktop.org"
 PKG_URL="https://gstreamer.freedesktop.org/src/gst-libav/gst-libav-${PKG_VERSION}.tar.xz"
 PKG_DEPENDS_TARGET="toolchain ffmpeg coretube-gst-plugins-base"
 PKG_LONGDESC="GStreamer plugin for the image's FFmpeg, used by the TizenTube add-on to decode audio."
+. $(get_pkg_directory coretube-gstreamer)/coretube.mk
 
-PKG_MESON_OPTS_TARGET="-Ddoc=disabled \
+PKG_MESON_OPTS_TARGET="${CORETUBE_MESON_OPTS} \
+                       -Ddoc=disabled \
                        -Dtests=disabled"

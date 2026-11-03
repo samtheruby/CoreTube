@@ -278,13 +278,15 @@ step_zip() {
   cp -r "$repo/addon/resources" "$repo/addon/bin" "$d/"
   find "$d" -type d -name __pycache__ -prune -exec rm -rf -- {} +
   cp "$runtime" "$helper" "$d/drm/"
-  cp "$install"/coretube-gstreamer-*/usr/lib/gstreamer-1.0/gst-plugin-scanner "$d/bin/"
+  # Our packages install under a private prefix (coretube-gstreamer/coretube.mk).
+  local p=usr/lib/coretube
+  cp "$install"/coretube-gstreamer-*/$p/libexec/gstreamer-1.0/gst-plugin-scanner "$d/bin/"
   # GStreamer: the libraries Cobalt and the plugins link, and all our plugins.
-  cp -L "$install"/coretube-gstreamer-*/usr/lib/{libgstreamer,libgstbase,libgstnet}-1.0.so.0 \
-        "$install"/coretube-gst-plugins-base-*/usr/lib/libgst{allocators,app,audio,pbutils,riff,rtp,tag,video}-1.0.so.0 \
-        "$install"/coretube-gst-plugins-bad-*/usr/lib/libgstcodecparsers-1.0.so.0 \
+  cp -L "$install"/coretube-gstreamer-*/$p/lib/{libgstreamer,libgstbase,libgstnet}-1.0.so.0 \
+        "$install"/coretube-gst-plugins-base-*/$p/lib/libgst{allocators,app,audio,pbutils,riff,rtp,tag,video}-1.0.so.0 \
+        "$install"/coretube-gst-plugins-bad-*/$p/lib/libgstcodecparsers-1.0.so.0 \
         "$d/lib/"
-  cp "$install"/{coretube-gstreamer,coretube-gst-plugins-base,coretube-gst-plugins-good,coretube-gst-plugins-bad,coretube-gst-libav,coretube-amlvideosink}-*/usr/lib/gstreamer-1.0/*.so \
+  cp "$install"/{coretube-gstreamer,coretube-gst-plugins-base,coretube-gst-plugins-good,coretube-gst-plugins-bad,coretube-gst-libav,coretube-amlvideosink}-*/$p/lib/gstreamer-1.0/*.so \
      "$d/lib/gstreamer-1.0/"
   cp "$out/libloader_app.so" "$d/cobalt/"
   cp "$out/starboard/libocdm.so" "$d/lib/"

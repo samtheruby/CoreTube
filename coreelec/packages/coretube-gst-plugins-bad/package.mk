@@ -9,9 +9,11 @@ PKG_SITE="https://gstreamer.freedesktop.org"
 PKG_URL="https://gstreamer.freedesktop.org/src/gst-plugins-bad/gst-plugins-bad-${PKG_VERSION}.tar.xz"
 PKG_DEPENDS_TARGET="toolchain coretube-gst-plugins-base"
 PKG_LONGDESC="GStreamer bad plugins for the TizenTube add-on."
+. $(get_pkg_directory coretube-gstreamer)/coretube.mk
 
 # H.264/H.265/VP9 parsers to feed the hardware decoder whole frames, and the
 # debug utilities (fakevideosink for players without video).
-PKG_MESON_OPTS_TARGET="-Dauto_features=disabled \
+PKG_MESON_OPTS_TARGET="${CORETUBE_MESON_OPTS} \
+                       -Dauto_features=disabled \
                        -Ddebugutils=enabled \
                        -Dvideoparsers=enabled"
