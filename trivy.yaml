@@ -1,0 +1,5 @@
+# trivy (trivy-scan) reads this from the repo root. work/ holds downloaded third-party
+# sources and toolchains (Android NDK, CoreELEC), never committed or shipped.
+scan:
+  skip-dirs:
+    - work
