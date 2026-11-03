@@ -53,3 +53,28 @@ class BundleTests(unittest.TestCase):
                 archive.addfile(entry)
             with self.assertRaises(ValueError):
                 validate_bundle(path)
+
+
+class LibrariesOnlyTests(unittest.TestCase):
+    def test_rejects_non_library_files_even_when_listed(self):
+        # A profile or key file must never ship, even with a matching manifest entry.
+        for extra in ("vendor/lib/ay64.dat", "system/lib/vndk-28/cert.bin"):
+            files = {
+                "system/bin/linker": b"linker",
+                "vendor/lib/libwvhidl.so": b"library",
+                extra: b"secret",
+            }
+            manifest = {
+                name: {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+                for name, data in files.items()
+            }
+            files["runtime-manifest.json"] = json.dumps(manifest).encode()
+            with tempfile.TemporaryDirectory() as temporary:
+                path = pathlib.Path(temporary) / "runtime.tar.gz"
+                with tarfile.open(path, "w:gz") as archive:
+                    for name, data in files.items():
+                        entry = tarfile.TarInfo(name)
+                        entry.size = len(data)
+                        archive.addfile(entry, io.BytesIO(data))
+                with self.subTest(extra=extra), self.assertRaises(ValueError):
+                    validate_bundle(path)

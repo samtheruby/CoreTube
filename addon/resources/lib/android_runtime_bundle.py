@@ -25,7 +25,8 @@ def validate_bundle(path):
                 or any(part in (".", "..") for part in member.name.split("/"))
                 or member.name in files
                 or not re.fullmatch(
-                    r"runtime-manifest\.json|system/bin/linker|(?:system|vendor)/lib/(?:vndk(?:-sp)?-28/)?[A-Za-z0-9_@.+-]+",
+                    # Libraries only: a profile or key file never belongs here.
+                    r"runtime-manifest\.json|system/bin/linker|(?:system|vendor)/lib/(?:vndk(?:-sp)?-28/)?[A-Za-z0-9_@.+-]+\.so",
                     member.name,
                 )
             ):
