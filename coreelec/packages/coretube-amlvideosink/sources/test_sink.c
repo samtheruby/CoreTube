@@ -163,6 +163,69 @@ static void test_seek_inside_gop(void)
   gst_caps_unref(h264);
 }
 
+static gpointer push_buffers(gpointer data)
+{
+  GstPad *pad = data;
+  GstClockTime *pts = g_object_get_data(G_OBJECT(pad), "pts");
+
+  for (; *pts != GST_CLOCK_TIME_NONE; pts++) {
+    GstBuffer *buf = gst_buffer_new_wrapped(g_memdup2("\0\0\0\1", 4), 4);
+
+    GST_BUFFER_PTS(buf) = *pts;
+    GST_BUFFER_DURATION(buf) = GST_SECOND / 60;
+    if (gst_pad_chain(pad, buf) != GST_FLOW_OK)
+      break;
+  }
+  return NULL;
+}
+
+/* While a seek prerolls, Cobalt's player waits for frames past the target to leave
+ * its queue. The frames before the target must go to the decoder without the sink
+ * prerolling on them; the first frame at the target prerolls as usual. */
+static void test_preroll_after_seek(void)
+{
+  GstElement *sink = g_object_new(GST_TYPE_AML_VIDEO_SINK, NULL);
+  GstPad *pad = gst_element_get_static_pad(sink, "sink");
+  GstCaps *h264 = gst_caps_from_string(H264_CAPS ", width=1920, height=1080");
+  GstClockTime before[] = {4267 * GST_MSECOND, 4300 * GST_MSECOND, GST_CLOCK_TIME_NONE};
+  GstClockTime target[] = {5 * GST_SECOND, GST_CLOCK_TIME_NONE};
+  GstSegment segment;
+  GThread *thread;
+
+  g_object_set(sink, "rectangle", "100,100,640,360", NULL);
+  assert(gst_element_set_state(sink, GST_STATE_PAUSED) == GST_STATE_CHANGE_ASYNC);
+  assert(gst_pad_send_event(pad, gst_event_new_stream_start("seek")));
+  assert(gst_pad_send_event(pad, gst_event_new_caps(h264)));
+  gst_segment_init(&segment, GST_FORMAT_TIME);
+  segment.start = segment.time = segment.position = 5 * GST_SECOND;
+  assert(gst_pad_send_event(pad, gst_event_new_segment(&segment)));
+
+  g_byte_array_set_size(written, 0);
+  checkin_count = 0;
+  g_object_set_data(G_OBJECT(pad), "pts", before);
+  thread = g_thread_new("before", push_buffers, pad);
+  g_usleep(300 * 1000);
+  assert(written->len == 8);               /* both reached the decoder without blocking */
+  assert(checkin_count == 2 && checkins[0] == to_pts(0) && checkins[1] == to_pts(0));
+  assert(gst_element_get_state(sink, NULL, NULL, 0) == GST_STATE_CHANGE_ASYNC); /* no preroll yet */
+  gst_element_set_state(sink, GST_STATE_READY); /* unblocks the thread if it hangs */
+  g_thread_join(thread);
+
+  assert(gst_element_set_state(sink, GST_STATE_PAUSED) == GST_STATE_CHANGE_ASYNC);
+  assert(gst_pad_send_event(pad, gst_event_new_stream_start("seek")));
+  assert(gst_pad_send_event(pad, gst_event_new_caps(h264)));
+  assert(gst_pad_send_event(pad, gst_event_new_segment(&segment)));
+  g_object_set_data(G_OBJECT(pad), "pts", target);
+  thread = g_thread_new("target", push_buffers, pad);
+  assert(gst_element_get_state(sink, NULL, NULL, GST_SECOND) == GST_STATE_CHANGE_SUCCESS);
+
+  gst_element_set_state(sink, GST_STATE_NULL);
+  g_thread_join(thread);
+  gst_object_unref(pad);
+  gst_object_unref(sink);
+  gst_caps_unref(h264);
+}
+
 /* The S922Z box's vcodec_profile (excerpt), and one with AV1 hardware. */
 static const char *g12b = "h264:4k;\nhevc:8k, 8bit, 10bit, dwrite, compressed, frame_dv, fence;\nav1_unsupport:;\nmav1:;\nvp9:8k, 10bit, dwrite, compressed, fence;\n";
 static const char *s905x4 = "h264:4k;\nav1:4k, 10bit, dwrite, compressed;\nvp9:4k, 10bit;\n";
@@ -218,6 +281,7 @@ int main(void)
                    "mW.x:15635;mW.y:16450;mMaxDL:10000000;mMinDL:50;mCLLPresent:1;mMaxCLL:1000;mMaxFALL:400;mTransfer:16") == 0);
   test_decoder_sysfs();
   test_seek_inside_gop();
+  test_preroll_after_seek();
   g_print("all sink tests passed\n");
   return 0;
 }

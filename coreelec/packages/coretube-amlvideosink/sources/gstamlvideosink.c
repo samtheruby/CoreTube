@@ -103,6 +103,7 @@ struct _GstAmlVideoSink {
   guint32 last_pts; /* 90 kHz timestamp of the last frame handed to the decoder */
   gchar *config;    /* decoder config string; codec.config points here while open */
   gint saved_blackout; /* blackout_policy before the decoder opened; -1 when not changed */
+  GstPadChainFunction base_chain; /* GstBaseSink's, for frames inside the segment */
 
   /* Screen mute while a decoder (re)starts; guarded by hold_lock. */
   GMutex hold_lock;
@@ -637,23 +638,12 @@ static GstFlowReturn write_av1(GstAmlVideoSink *self, const guint8 *data, gsize 
   return ret;
 }
 
-static GstFlowReturn gst_aml_video_sink_render(GstBaseSink *bsink, GstBuffer *buffer)
+/* Queues the frame's timestamp (when valid) and hands the frame to the decoder. */
+static GstFlowReturn write_frame(GstAmlVideoSink *self, GstBuffer *buffer, GstClockTime running_time)
 {
-  GstAmlVideoSink *self = GST_AML_VIDEO_SINK(bsink);
-  GstClockTime pts = GST_BUFFER_PTS(buffer), running_time;
   GstFlowReturn ret;
   GstMapInfo map;
 
-  if (!self->open)
-    return GST_FLOW_NOT_NEGOTIATED;
-
-  sync_hardware_clock(self, FALSE);
-
-  /* Frames before the segment start lead from a keyframe up to a seek target. The
-   * decoder needs them, and timed at the start the hardware skips straight past them. */
-  if (GST_CLOCK_TIME_IS_VALID(pts) && pts < bsink->segment.start)
-    pts = bsink->segment.start;
-  running_time = gst_segment_to_running_time(&bsink->segment, GST_FORMAT_TIME, pts);
   if (GST_CLOCK_TIME_IS_VALID(running_time)) {
     self->last_pts = to_pts(running_time);
     if (amcodec.checkin_pts(&self->codec, self->last_pts) != 0)
@@ -670,6 +660,36 @@ static GstFlowReturn gst_aml_video_sink_render(GstBaseSink *bsink, GstBuffer *bu
   else
     ret = write_all(self, map.data, map.size);
   gst_buffer_unmap(buffer, &map);
+  return ret;
+}
+
+static GstFlowReturn gst_aml_video_sink_render(GstBaseSink *bsink, GstBuffer *buffer)
+{
+  GstAmlVideoSink *self = GST_AML_VIDEO_SINK(bsink);
+
+  if (!self->open)
+    return GST_FLOW_NOT_NEGOTIATED;
+  sync_hardware_clock(self, FALSE);
+  return write_frame(self, buffer,
+      gst_segment_to_running_time(&bsink->segment, GST_FORMAT_TIME, GST_BUFFER_PTS(buffer)));
+}
+
+/* Frames before the segment start lead from a keyframe up to a seek target. The
+ * decoder needs them, and timed at the start the hardware skips straight past them.
+ * They go to the decoder here, before GstBaseSink, which would drop them or, kept,
+ * preroll on the first one; Cobalt's player only finishes a seek once frames past
+ * the target have left its queue, which a keyframe seconds earlier can fill. */
+static GstFlowReturn gst_aml_video_sink_chain(GstPad *pad, GstObject *parent, GstBuffer *buffer)
+{
+  GstAmlVideoSink *self = GST_AML_VIDEO_SINK(parent);
+  GstSegment *segment = &GST_BASE_SINK(parent)->segment;
+  GstClockTime pts = GST_BUFFER_PTS(buffer);
+  GstFlowReturn ret;
+
+  if (!self->open || segment->format != GST_FORMAT_TIME || !GST_CLOCK_TIME_IS_VALID(pts) || pts >= segment->start)
+    return self->base_chain(pad, parent, buffer);
+  ret = write_frame(self, buffer, gst_segment_to_running_time(segment, GST_FORMAT_TIME, segment->start));
+  gst_buffer_unref(buffer);
   return ret;
 }
 
@@ -840,8 +860,9 @@ static void gst_aml_video_sink_init(GstAmlVideoSink *self)
   gst_base_sink_set_ts_offset(bsink, -(GstClockTimeDiff)LEAD_TIME);
   gst_base_sink_set_max_lateness(bsink, -1);
   gst_base_sink_set_qos_enabled(bsink, FALSE);
-  /* Not even frames before the segment start: render() explains why. */
-  gst_base_sink_set_drop_out_of_segment(bsink, FALSE);
+  /* Frames before the segment start take a way around GstBaseSink. */
+  self->base_chain = GST_PAD_CHAINFUNC(GST_BASE_SINK_PAD(bsink));
+  gst_pad_set_chain_function(GST_BASE_SINK_PAD(bsink), gst_aml_video_sink_chain);
 }
 
 static gboolean plugin_init(GstPlugin *plugin)
