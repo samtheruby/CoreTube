@@ -12,7 +12,7 @@ dl_dep = dependency('dl')
 # They include each other as <codec_type.h>, so their folder must be on the path.
 amcodec_inc = meson.get_external_property('root') / 'include' / 'amcodec'
 
-shared_module('gstamlvideosink', 'gstamlvideosink.c', 'aml_pacer.c',
+shared_module('gstamlvideosink', 'gstamlvideosink.c', 'aml_pacer.c', 'aml_presenter.c',
   c_args: ['-I' + amcodec_inc,
            '-DPACKAGE="@0@"'.format(meson.project_name()),
            '-DVERSION="@0@"'.format(meson.project_version())],

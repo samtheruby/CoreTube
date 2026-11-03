@@ -5,6 +5,7 @@
 #define VIDEO_HOLD_TIMEOUT (200 * GST_MSECOND)
 #include "gstamlvideosink.c"
 #include "aml_pacer.c"
+#include "aml_presenter.c"
 #include <assert.h>
 
 static GByteArray *written;
@@ -340,6 +341,290 @@ static void test_vsync_median(void)
   assert(aml_pacer_vsync_us(intervals, 3) == 16667);
 }
 
+/* Fake amlvideo for the presenter: the test releases each poll (a vsync or a timeout),
+ * decides which frames the decoder has ready, and reads back every frame queued. */
+typedef struct {
+  GMutex lock;
+  GCond cond;
+  AmlPresenter *presenter;
+  guint ticks;          /* polls the test has released and the presenter not yet taken */
+  gboolean vsync;       /* released polls are vsyncs (else timeouts) */
+  gboolean in_poll;     /* the presenter waits in poll */
+  guint polls, bad_timeouts;
+  gint64 now, base;     /* fake clock; running time = now - base while the clock runs */
+  gboolean clock_running;
+  struct { guint index; guint64 pts; } decoded[64];
+  guint n_decoded, next_decoded;
+  struct { guint index; gboolean drop; } log[256];
+  guint n_log;
+} FakeVideo;
+
+static int fake_poll_vsync(void *ctx, int timeout_ms)
+{
+  FakeVideo *f = ctx;
+  int ret = 0;
+
+  g_mutex_lock(&f->lock);
+  if (timeout_ms != 50)
+    f->bad_timeouts++;
+  f->in_poll = TRUE;
+  g_cond_broadcast(&f->cond);
+  while (!f->ticks && !g_atomic_int_get(&f->presenter->stopping))
+    g_cond_wait_until(&f->cond, &f->lock, g_get_monotonic_time() + 5000);
+  f->in_poll = FALSE;
+  if (f->ticks) {
+    f->ticks--;
+    f->polls++;
+    if (f->vsync) {
+      f->now += 16667;
+      ret = 1;
+    }
+  }
+  g_mutex_unlock(&f->lock);
+  return ret;
+}
+
+static int fake_dequeue(void *ctx, guint *index, guint64 *pts_us)
+{
+  FakeVideo *f = ctx;
+  int ret = -EAGAIN;
+
+  g_mutex_lock(&f->lock);
+  if (f->next_decoded < f->n_decoded) {
+    *index = f->decoded[f->next_decoded].index;
+    *pts_us = f->decoded[f->next_decoded].pts;
+    f->next_decoded++;
+    ret = 0;
+  }
+  g_mutex_unlock(&f->lock);
+  return ret;
+}
+
+static int fake_queue(void *ctx, guint index, gboolean drop)
+{
+  FakeVideo *f = ctx;
+
+  g_mutex_lock(&f->lock);
+  assert(f->n_log < G_N_ELEMENTS(f->log));
+  f->log[f->n_log].index = index;
+  f->log[f->n_log].drop = drop;
+  f->n_log++;
+  g_mutex_unlock(&f->lock);
+  return 0;
+}
+
+static gint64 fake_running_us(void *ctx)
+{
+  FakeVideo *f = ctx;
+  gint64 running;
+
+  g_mutex_lock(&f->lock);
+  running = f->clock_running ? f->now - f->base : -1;
+  g_mutex_unlock(&f->lock);
+  return running;
+}
+
+static gint64 fake_now_us(void *ctx)
+{
+  FakeVideo *f = ctx;
+  gint64 now;
+
+  g_mutex_lock(&f->lock);
+  now = f->now;
+  g_mutex_unlock(&f->lock);
+  return now;
+}
+
+static const AmlPresenterOps fake_video_ops = {fake_poll_vsync, fake_dequeue, fake_queue, fake_running_us, fake_now_us};
+
+static FakeVideo *fake_video_new(void)
+{
+  FakeVideo *f = g_new0(FakeVideo, 1);
+  GstSegment segment;
+
+  g_mutex_init(&f->lock);
+  g_cond_init(&f->cond);
+  f->vsync = TRUE;
+  f->presenter = aml_presenter_new(&fake_video_ops, f);
+  gst_segment_init(&segment, GST_FORMAT_TIME);
+  aml_presenter_set_segment(f->presenter, &segment);
+  return f;
+}
+
+static void fake_video_free(FakeVideo *f)
+{
+  aml_presenter_free(f->presenter);
+  g_mutex_clear(&f->lock);
+  g_cond_clear(&f->cond);
+  g_free(f);
+}
+
+/* The decoder has a frame ready; pts as amlvideo gives it (stream time in us + 1, 0 = none). */
+static void decoded(FakeVideo *f, guint index, guint64 pts)
+{
+  g_mutex_lock(&f->lock);
+  f->decoded[f->n_decoded].index = index;
+  f->decoded[f->n_decoded].pts = pts;
+  f->n_decoded++;
+  g_mutex_unlock(&f->lock);
+}
+
+/* Releases n polls and waits until the presenter has handled each one. */
+static void tick(FakeVideo *f, guint n, gboolean vsync)
+{
+  g_mutex_lock(&f->lock);
+  for (guint i = 0; i < n; i++) {
+    while (!f->in_poll)
+      g_cond_wait(&f->cond, &f->lock);
+    f->vsync = vsync;
+    f->ticks = 1;
+    g_cond_broadcast(&f->cond);
+    while (f->ticks || !f->in_poll)
+      g_cond_wait(&f->cond, &f->lock);
+  }
+  g_mutex_unlock(&f->lock);
+}
+
+static void play(FakeVideo *f, gint64 running_now)
+{
+  g_mutex_lock(&f->lock);
+  f->clock_running = TRUE;
+  f->base = f->now - running_now;
+  g_mutex_unlock(&f->lock);
+  aml_presenter_set_playing(f->presenter, TRUE);
+}
+
+static guint count_queued(FakeVideo *f, guint index, gboolean drop)
+{
+  guint n = 0;
+
+  for (guint i = 0; i < f->n_log; i++)
+    n += f->log[i].index == index && f->log[i].drop == drop;
+  return n;
+}
+
+static void test_presents_in_order(void)
+{
+  FakeVideo *f = fake_video_new();
+
+  for (guint i = 0; i < 10; i++)
+    decoded(f, i, 50000 + i * 33333 + 1);
+  play(f, 0);
+  aml_presenter_start(f->presenter);
+  tick(f, 60, TRUE);
+  assert(f->n_log == 10);
+  for (guint i = 0; i < 10; i++)
+    assert(f->log[i].index == i && !f->log[i].drop);
+  fake_video_free(f);
+}
+
+/* Paused, the first frame is the preroll picture: shown once, the others wait. */
+static void test_paused_shows_first_frame_once(void)
+{
+  FakeVideo *f = fake_video_new();
+
+  for (guint i = 0; i < 3; i++)
+    decoded(f, i, i * 33333 + 1);
+  aml_presenter_start(f->presenter);
+  tick(f, 5, TRUE);
+  assert(f->n_log == 1 && f->log[0].index == 0 && !f->log[0].drop);
+
+  play(f, 0);
+  tick(f, 6, TRUE);
+  assert(f->n_log == 3 && count_queued(f, 1, FALSE) == 1 && count_queued(f, 2, FALSE) == 1);
+  fake_video_free(f);
+}
+
+/* A flush hands every held buffer back, so the decoder can be reset or closed. */
+static void test_flush_returns_every_buffer(void)
+{
+  FakeVideo *f = fake_video_new();
+
+  for (guint i = 0; i < 4; i++)
+    decoded(f, i, i * 33333 + 1);
+  aml_presenter_start(f->presenter);
+  tick(f, 1, TRUE);
+  aml_presenter_flush(f->presenter);
+  assert(f->n_log == 4);
+  assert(count_queued(f, 0, FALSE) == 1);
+  for (guint i = 1; i < 4; i++)
+    assert(count_queued(f, i, TRUE) == 1);
+  fake_video_free(f);
+}
+
+/* No new frames: the screen keeps its frame, and every wait is a 50 ms poll. */
+static void test_stall_keeps_last_frame(void)
+{
+  FakeVideo *f = fake_video_new();
+
+  decoded(f, 0, 1);
+  play(f, 0);
+  aml_presenter_start(f->presenter);
+  tick(f, 1, TRUE);
+  assert(f->n_log == 1);
+  tick(f, 20, FALSE);
+  assert(f->n_log == 1);
+  assert(f->polls == 21 && f->bad_timeouts == 0);
+  fake_video_free(f);
+}
+
+static void count_shown(gpointer data) { (*(guint *)data)++; }
+
+static void test_shown_callback_once_per_start(void)
+{
+  FakeVideo *f = fake_video_new();
+  guint calls = 0;
+
+  aml_presenter_set_shown_callback(f->presenter, count_shown, &calls);
+  for (guint i = 0; i < 3; i++)
+    decoded(f, i, 50000 + i * 33333 + 1);
+  play(f, 0);
+  aml_presenter_start(f->presenter);
+  tick(f, 10, TRUE);
+  assert(f->n_log == 3 && calls == 1);
+
+  aml_presenter_flush(f->presenter);
+  decoded(f, 3, 1);
+  play(f, 0);
+  aml_presenter_start(f->presenter);
+  tick(f, 2, TRUE);
+  assert(count_queued(f, 3, FALSE) == 1 && calls == 2);
+  fake_video_free(f);
+}
+
+/* amlvideo gives the first frame after the decoder opens no timestamp (pts 0). It
+ * takes the segment start, so it is shown, not dropped as before the segment. */
+static void test_frame_without_pts_is_shown(void)
+{
+  FakeVideo *f = fake_video_new();
+  GstSegment segment;
+
+  gst_segment_init(&segment, GST_FORMAT_TIME);
+  segment.start = segment.time = 5 * GST_SECOND;
+  aml_presenter_set_segment(f->presenter, &segment);
+  decoded(f, 0, 0);
+  decoded(f, 1, 5033334);
+  aml_presenter_start(f->presenter);
+  tick(f, 1, TRUE);
+  assert(f->n_log == 1 && f->log[0].index == 0 && !f->log[0].drop);
+  fake_video_free(f);
+}
+
+/* End of stream waits for the last frame on screen, or gives up at the timeout. */
+static void test_wait_shown(void)
+{
+  FakeVideo *f = fake_video_new();
+
+  decoded(f, 0, 50001);
+  decoded(f, 1, 83334);
+  play(f, 0);
+  aml_presenter_start(f->presenter);
+  tick(f, 6, TRUE);
+  assert(aml_presenter_wait_shown(f->presenter, 83334, G_USEC_PER_SEC) == 83334);
+  assert(aml_presenter_wait_shown(f->presenter, 116667, 20000) == 83334);
+  fake_video_free(f);
+}
+
 /* The S922Z box's vcodec_profile (excerpt), and one with AV1 hardware. */
 static const char *g12b = "h264:4k;\nhevc:8k, 8bit, 10bit, dwrite, compressed, frame_dv, fence;\nav1_unsupport:;\nmav1:;\nvp9:8k, 10bit, dwrite, compressed, fence;\n";
 static const char *s905x4 = "h264:4k;\nav1:4k, 10bit, dwrite, compressed;\nvp9:4k, 10bit;\n";
@@ -403,6 +688,13 @@ int main(void)
   test_nothing_due();
   test_double_speed_shows_each_frame_once();
   test_vsync_median();
+  test_presents_in_order();
+  test_paused_shows_first_frame_once();
+  test_flush_returns_every_buffer();
+  test_stall_keeps_last_frame();
+  test_shown_callback_once_per_start();
+  test_frame_without_pts_is_shown();
+  test_wait_shown();
   g_print("all sink tests passed\n");
   return 0;
 }
