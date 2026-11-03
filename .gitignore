@@ -1,0 +1,16 @@
+# Build output and fetched sources
+out/
+work/
+
+# Python and tool caches
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# Planning and AI assistant files
+.claude/
+.codex/
+.superpowers/
+CLAUDE.md
+AGENTS.md
