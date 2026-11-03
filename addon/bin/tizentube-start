@@ -61,6 +61,11 @@ fi
 
 systemctl stop kodi
 
+# The display mode as Kodi left it. Auto frame rate changes it; tizentube-stop
+# puts it back should Cobalt end without doing so (a crash).
+echo "$(cat /sys/class/display/mode) $(cat /sys/class/amhdmitx/amhdmitx0/frac_rate_policy)" \
+  > /run/tizentube-display-state 2>/dev/null || true
+
 # Some kernels report ALSA pause but never play on after it. Test it once while
 # the device is free; if it fails, GStreamer stops and restarts the device instead.
 audio_pause="hardware"
@@ -109,8 +114,6 @@ python3 "${ADDON_DIR}/bin/fb-resize.py" ${page_w} ${page_h} ${TIZENTUBE_FB_BUFFE
 graphics="framebuffer ${screen_w}x${screen_h}, page ${page_w}x${page_h}"
 else
   graphics="GBM/DRM (native display mode)"
-  # shortcut: GBM uses the current DRM mode; add DRM mode changes before AFR.
-  export TIZENTUBE_DISPLAY_MODES=""
 fi
 
 # Cobalt keeps cookies and settings under $HOME/.cobalt_storage. Android DRM

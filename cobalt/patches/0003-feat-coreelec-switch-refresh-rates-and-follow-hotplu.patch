@@ -1,0 +1,737 @@
+From 8eb86da5e381012d081848788901f2e679a8370c Mon Sep 17 00:00:00 2001
+From: samtheruby <peasea1012@gmail.com>
+Date: Tue, 3 Nov 2026 08:26:15 +0000
+Subject: [PATCH] feat(coreelec): switch refresh rates and follow hotplug on
+ DRM displays
+
+On CoreELEC Amlogic-no the window shows frames through DRM, where the
+driver ignores /sys/class/display mode writes, so auto frame rate did
+nothing and an unplugged TV froze the picture for good (a page flip that
+never completed kept both buffers locked).
+
+- Auto frame rate on DRM: SetFrameRate's choice (now ChooseModeSwitch,
+  shared with the framebuffer path) goes to the GBM window, which switches
+  to the same-size mode on the next frame. 23.976 Hz and friends use the
+  connector's FRAC_RATE_POLICY property. Close restores the mode and
+  1000/1001 state the display had, for Kodi.
+- Hotplug: the window re-reads the connector once a second. It stops
+  showing frames while the TV is gone and, when one is back, shows the
+  mode of the window's size closest to the last one (ChooseOutputMode).
+  A flip that does not complete turns scanout off and starts over.
+- The flip-done flag lives in the window, not on the stack, so a late
+  event cannot write into a finished call.
+---
+ .../coreelec/tests/coreelec_display_test.cc   |  29 +++
+ .../starboard/rdk/shared/application_rdk.cc   |   8 +
+ .../starboard/rdk/shared/coreelec_display.cc  | 126 +++++++---
+ .../starboard/rdk/shared/coreelec_display.h   |  43 ++++
+ .../starboard/rdk/shared/coreelec_gbm.cc      | 236 ++++++++++++++++--
+ .../starboard/rdk/shared/coreelec_gbm.h       |  39 ++-
+ 6 files changed, 422 insertions(+), 59 deletions(-)
+
+diff --git a/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/tests/coreelec_display_test.cc b/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/tests/coreelec_display_test.cc
+index 66e9bbca4e2..24da3fefaea 100644
+--- a/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/tests/coreelec_display_test.cc
++++ b/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/tests/coreelec_display_test.cc
+@@ -39,6 +39,35 @@ int main() {
+   // 24 fps without a 24 Hz mode falls back to 23.976 (0.1% off), not to 60.
+   auto no24 = ParseAllowedModes("3840x2160@23.976 3840x2160@60");
+   assert(near(ChooseRefreshRate(no24, 3840, 2160, 24), 23.976));
++
++  // The switch auto frame rate asks for: mode name and 1000/1001 flag.
++  const std::string modes = "1920x1080@60 1920x1080@59.94 1920x1080@24 1920x1080@23.976";
++  const std::string caps = "1080p60hz*\n1080p24hz\n1080i60hz\n2160p60hz\n";
++  auto s = ChooseModeSwitch(modes, "1080p60hz", false, caps, 23.976);
++  assert(s && s->name == "1080p24hz" && s->fractional);
++  s = ChooseModeSwitch(modes, "1080p60hz", false, caps, 24);
++  assert(s && s->name == "1080p24hz" && !s->fractional);
++  s = ChooseModeSwitch(modes, "1080p24hz", true, caps, 59.94);
++  assert(s && s->name == "1080p60hz" && s->fractional);
++  assert(!ChooseModeSwitch(modes, "1080p60hz", false, caps, 60));          // already there
++  assert(!ChooseModeSwitch(modes, "1080p24hz", true, caps, 23.976));       // already there
++  assert(!ChooseModeSwitch(modes, "1080p60hz", false, "1080p60hz\n", 24)); // TV lacks 24 Hz
++  assert(!ChooseModeSwitch("", "1080p60hz", false, caps, 24));             // no allowed modes
++  assert(!ChooseModeSwitch(modes, "1080i60hz", false, caps, 24));          // interlaced now
++  assert(!ChooseModeSwitch(modes, "1080p60hz", false, caps, 0));
++
++  // The mode for a WxH picture after the display changed (hotplug, another TV).
++  std::vector<OutputMode> outputs = {
++      {"2160p60hz", 3840, 2160, false, 60}, {"1080i60hz", 1920, 1080, true, 60},
++      {"1080p50hz", 1920, 1080, false, 50}, {"1080p24hz", 1920, 1080, false, 24},
++      {"1080p60hz", 1920, 1080, false, 60}};
++  assert(ChooseOutputMode(outputs, 1920, 1080, "1080p24hz") == 3);  // still listed
++  assert(ChooseOutputMode(outputs, 1920, 1080, "1080p30hz") == 3);  // closest rate: 24
++  assert(ChooseOutputMode(outputs, 1920, 1080, "") == 4);           // no wish: 60 Hz
++  std::vector<OutputMode> other_tv = {{"1080i60hz", 1920, 1080, true, 60},
++                                      {"2160p60hz", 3840, 2160, false, 60}};
++  assert(ChooseOutputMode(other_tv, 1920, 1080, "1080p60hz") == -1);  // no progressive 1080
++  assert(ChooseOutputMode({}, 1920, 1080, "1080p60hz") == -1);
+   std::cout << "all display tests passed\n";
+   return 0;
+ }
+diff --git a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/application_rdk.cc b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/application_rdk.cc
+index 318e303c6fa..f319f6d31a6 100644
+--- a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/application_rdk.cc
++++ b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/application_rdk.cc
+@@ -41,6 +41,9 @@
+ #include "third_party/starboard/rdk/shared/time_constants.h"
+ #include "third_party/starboard/rdk/shared/platform/platform_interface.h"
+ #include "third_party/starboard/rdk/shared/libcobalt.h"
++#if defined(COREELEC_GBM)
++#include "third_party/starboard/rdk/shared/coreelec_display.h"
++#endif
+ 
+ #if defined(ENABLE_RDKSERVICES_API)
+ #include "third_party/starboard/rdk/shared/rdkservices.h"
+@@ -328,6 +331,11 @@ SbWindow ApplicationRdk::CreateSbWindow(const SbWindowOptions* options) {
+   if (!gbm_.Open()) return kSbWindowInvalid;
+   window_width_ = gbm_.width();
+   window_height_ = gbm_.height();
++  // On DRM the driver ignores sysfs mode writes: auto frame rate goes through GBM.
++  namespace coreelec = ::third_party::starboard::rdk::shared::coreelec;
++  coreelec::SetModeSetter([this](const coreelec::ModeSwitch& target) {
++    return gbm_.RequestMode(target.name, target.fractional);
++  });
+   // Ozone widgets are 32-bit IDs; keep the GBM pointer inside the native bridge.
+   native_window_ = reinterpret_cast<NativeWindowType>(1);
+ #else
+diff --git a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.cc b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.cc
+index 0733670d05d..5a41ac4857f 100644
+--- a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.cc
++++ b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.cc
+@@ -7,6 +7,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <fstream>
++#include <mutex>
+ #include <regex>
+ #include <sstream>
+ 
+@@ -48,8 +49,8 @@ double ActualRate(int rate, bool fractional) {
+ }
+ 
+ // disp_cap lists the modes the TV takes, one per line, the current one marked "*".
+-bool DisplayTakes(const std::string& name) {
+-  std::istringstream lines(ReadFile(kDisplayCapsPath));
++bool DisplayTakes(const std::string& display_caps, const std::string& name) {
++  std::istringstream lines(display_caps);
+   for (std::string line; std::getline(lines, line);) {
+     line.erase(line.find_last_not_of(" *\t\r") + 1);
+     if (line == name) {
+@@ -59,40 +60,34 @@ bool DisplayTakes(const std::string& name) {
+   return false;
+ }
+ 
++std::mutex g_setter_mutex;
++ModeSetter g_setter;
++
+ void SetFrameRate(float frame_rate) {
+-  if (!(frame_rate > 0)) {
+-    return;
+-  }
+   const char* allowed = getenv("TIZENTUBE_DISPLAY_MODES");
+-  auto current = ParseMode(ReadFile(kModePath));
+-  if (!allowed || !*allowed || !current || current->interlaced) {
+-    SB_LOG(INFO) << "Auto frame rate: no display modes to switch to";
+-    return;
+-  }
+-  double rate = ChooseRefreshRate(ParseAllowedModes(allowed), current->width,
+-                                  current->height, frame_rate);
+-  if (rate <= 0) {
+-    SB_LOG(INFO) << "Auto frame rate: no allowed mode fits " << frame_rate
+-                 << " fps at " << current->width << "x" << current->height;
+-    return;
+-  }
+-
+-  int whole = static_cast<int>(std::lround(rate));
+-  bool fractional = std::fabs(rate - whole) > 0.01;
+-  bool current_fractional = ReadFile(kFracRatePath) == "1";
+-  if (std::fabs(ActualRate(whole, fractional) -
+-                ActualRate(current->rate, current_fractional)) < 0.01) {
+-    return;
+-  }
+-  std::string name = current->prefix + std::to_string(whole) + "hz";
+-  if (!DisplayTakes(name)) {
+-    SB_LOG(WARNING) << "Auto frame rate: the TV does not list " << name;
++  std::string why;
++  auto target = ChooseModeSwitch(allowed ? allowed : "", ReadFile(kModePath),
++                                 ReadFile(kFracRatePath) == "1",
++                                 ReadFile(kDisplayCapsPath), frame_rate, &why);
++  if (!target) {
++    if (!why.empty()) {
++      SB_LOG(INFO) << "Auto frame rate: " << why;
++    }
+     return;
+   }
+   SB_LOG(INFO) << "Auto frame rate: " << frame_rate << " fps, switching to "
+-               << name << (fractional ? " (1000/1001)" : "");
+-  if (WriteFile(kFracRatePath, fractional ? "1" : "0")) {
+-    WriteFile(kModePath, name + current->suffix);
++               << target->name << (target->fractional ? " (1000/1001)" : "");
++  ModeSetter setter;
++  {
++    std::lock_guard<std::mutex> lock(g_setter_mutex);
++    setter = g_setter;
++  }
++  if (setter) {
++    if (!setter(*target)) {
++      SB_LOG(WARNING) << "Auto frame rate: the display cannot switch to " << target->name;
++    }
++  } else if (WriteFile(kFracRatePath, target->fractional ? "1" : "0")) {
++    WriteFile(kModePath, target->name + target->suffix);
+   }
+ }
+ 
+@@ -257,6 +252,75 @@ double ChooseRefreshRate(const std::vector<AllowedMode>& allowed,
+   return best_rate;
+ }
+ 
++std::optional<ModeSwitch> ChooseModeSwitch(const std::string& allowed,
++                                           const std::string& current_name,
++                                           bool current_fractional,
++                                           const std::string& display_caps,
++                                           double frame_rate,
++                                           std::string* why) {
++  auto explain = [why](const std::string& text) {
++    if (why) {
++      *why = text;
++    }
++    return std::nullopt;
++  };
++  if (!(frame_rate > 0)) {
++    return std::nullopt;
++  }
++  auto current = ParseMode(current_name);
++  if (allowed.empty() || !current || current->interlaced) {
++    return explain("no display modes to switch to");
++  }
++  double rate = ChooseRefreshRate(ParseAllowedModes(allowed), current->width,
++                                  current->height, frame_rate);
++  if (rate <= 0) {
++    std::ostringstream text;
++    text << "no allowed mode fits " << frame_rate << " fps at " << current->width
++         << "x" << current->height;
++    return explain(text.str());
++  }
++  int whole = static_cast<int>(std::lround(rate));
++  bool fractional = std::fabs(rate - whole) > 0.01;
++  if (std::fabs(ActualRate(whole, fractional) -
++                ActualRate(current->rate, current_fractional)) < 0.01) {
++    return std::nullopt;
++  }
++  ModeSwitch target{current->prefix + std::to_string(whole) + "hz", fractional,
++                    current->suffix};
++  if (!DisplayTakes(display_caps, target.name)) {
++    return explain("the TV does not list " + target.name);
++  }
++  return target;
++}
++
++void SetModeSetter(ModeSetter setter) {
++  std::lock_guard<std::mutex> lock(g_setter_mutex);
++  g_setter = std::move(setter);
++}
++
++int ChooseOutputMode(const std::vector<OutputMode>& modes,
++                     int width,
++                     int height,
++                     const std::string& wanted) {
++  auto wish = ParseMode(wanted);
++  int wanted_rate = wish ? wish->rate : 60;
++  int best = -1;
++  for (size_t i = 0; i < modes.size(); ++i) {
++    const OutputMode& mode = modes[i];
++    if (mode.width != width || mode.height != height || mode.interlaced) {
++      continue;
++    }
++    if (mode.name == wanted) {
++      return static_cast<int>(i);
++    }
++    if (best < 0 || std::abs(mode.rate - wanted_rate) <
++                        std::abs(modes[best].rate - wanted_rate)) {
++      best = static_cast<int>(i);
++    }
++  }
++  return best;
++}
++
+ std::unique_ptr<platform::PlatformInterface> CreatePlatformInterface() {
+   return std::make_unique<CoreELECInterface>();
+ }
+diff --git a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.h b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.h
+index a67eb354af7..59cf5b64632 100644
+--- a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.h
++++ b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.h
+@@ -7,6 +7,7 @@
+ #ifndef THIRD_PARTY_STARBOARD_RDK_SHARED_COREELEC_DISPLAY_H_
+ #define THIRD_PARTY_STARBOARD_RDK_SHARED_COREELEC_DISPLAY_H_
+ 
++#include <functional>
+ #include <memory>
+ #include <optional>
+ #include <string>
+@@ -48,6 +49,48 @@ double ChooseRefreshRate(const std::vector<AllowedMode>& allowed,
+                          int height,
+                          double frame_rate);
+ 
++// A display mode switch: the mode name and whether it runs 1000/1001 slower.
++struct ModeSwitch {
++  std::string name;    // "1080p24hz", as DRM names the mode
++  bool fractional = false;
++  std::string suffix;  // kept from the current sysfs mode name ("420")
++};
++
++// The switch that shows |frame_rate| best, from TIZENTUBE_DISPLAY_MODES
++// (|allowed|), the current mode name and 1000/1001 state, and disp_cap's text
++// (the modes the TV takes). Empty when there is nothing to switch; |why| then
++// says why, when given.
++std::optional<ModeSwitch> ChooseModeSwitch(const std::string& allowed,
++                                           const std::string& current,
++                                           bool current_fractional,
++                                           const std::string& display_caps,
++                                           double frame_rate,
++                                           std::string* why = nullptr);
++
++// How a switch reaches the display. Without a setter it is written to
++// /sys/class/display (framebuffer windows); a DRM window, where those writes are
++// ignored, installs one. Returns false when the switch cannot be made.
++using ModeSetter = std::function<bool(const ModeSwitch&)>;
++void SetModeSetter(ModeSetter setter);
++
++// A mode the connected display offers, as DRM lists it.
++struct OutputMode {
++  std::string name;  // Amlogic names DRM modes like the sysfs ones: "1080p24hz"
++  int width;
++  int height;
++  bool interlaced;
++  int rate;
++};
++
++// The mode to show a |width|x|height| picture on after the display changed
++// (plugged in again, another TV): |wanted| when listed, else the progressive
++// mode of that size closest in rate to |wanted| (to 60 Hz without a wish).
++// -1 when the display has no progressive mode of that size.
++int ChooseOutputMode(const std::vector<OutputMode>& modes,
++                     int width,
++                     int height,
++                     const std::string& wanted);
++
+ // Device and display properties for Cobalt (resolution, HDR).
+ std::unique_ptr<platform::PlatformInterface> CreatePlatformInterface();
+ 
+diff --git a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_gbm.cc b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_gbm.cc
+index 6bac5cc39ae..355318d9df0 100644
+--- a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_gbm.cc
++++ b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_gbm.cc
+@@ -1,8 +1,9 @@
+ // SPDX-License-Identifier: BSD-3-Clause
+ #include "coreelec_gbm.h"
++#include <algorithm>
+ #include <cerrno>
+-#include <chrono>
+ #include <cstdio>
++#include <cstring>
+ #include <drm_fourcc.h>
+ #include <fcntl.h>
+ #include <memory>
+@@ -10,10 +11,15 @@
+ #include <unistd.h>
+ #include <xf86drm.h>
+ 
++#include "third_party/starboard/rdk/shared/coreelec_display.h"
++
+ namespace {
+-void Flipped(int, unsigned, unsigned, unsigned, void *pending) {
+-  *static_cast<bool *>(pending) = false;
++void Flipped(int, unsigned, unsigned, unsigned, void *waiting) {
++  *static_cast<bool *>(waiting) = false;
+ }
++
++using ConnectorPtr =
++    std::unique_ptr<drmModeConnector, decltype(&drmModeFreeConnector)>;
+ } // namespace
+ 
+ CoreelecGbm::~CoreelecGbm() { Close(); }
+@@ -35,9 +41,8 @@ bool CoreelecGbm::Open() {
+   if (!resources)
+     return fail();
+   for (int i = 0; i < resources->count_connectors && !connector_; ++i) {
+-    std::unique_ptr<drmModeConnector, decltype(&drmModeFreeConnector)>
+-        connector(drmModeGetConnector(fd_, resources->connectors[i]),
+-                  drmModeFreeConnector);
++    ConnectorPtr connector(drmModeGetConnector(fd_, resources->connectors[i]),
++                           drmModeFreeConnector);
+     if (!connector || connector->connection != DRM_MODE_CONNECTED ||
+         connector->count_modes < 1)
+       continue;
+@@ -70,24 +75,126 @@ bool CoreelecGbm::Open() {
+         }
+       }
+     }
++    width_ = mode_.hdisplay;
++    height_ = mode_.vdisplay;
++    UseModes(*connector);
+   }
+-  if (!connector_ || !mode_.hdisplay || !mode_.vdisplay) {
++  if (!connector_ || !width_ || !height_) {
+     errno = ENODEV;
+     return fail();
+   }
++  start_mode_ = mode_;
++  // Amlogic's DRM driver runs 24/30/60/120 Hz 1000/1001 slower (23.976 Hz...)
++  // when the connector's FRAC_RATE_POLICY is set.
++  std::unique_ptr<drmModeObjectProperties,
++                  decltype(&drmModeFreeObjectProperties)>
++      properties(drmModeObjectGetProperties(fd_, connector_,
++                                            DRM_MODE_OBJECT_CONNECTOR),
++                 drmModeFreeObjectProperties);
++  for (uint32_t i = 0; properties && i < properties->count_props; ++i) {
++    std::unique_ptr<drmModePropertyRes, decltype(&drmModeFreeProperty)> property(
++        drmModeGetProperty(fd_, properties->props[i]), drmModeFreeProperty);
++    if (property && !strcmp(property->name, "FRAC_RATE_POLICY")) {
++      fractional_property_ = property->prop_id;
++      start_fractional_ = fractional_ = properties->prop_values[i] != 0;
++    }
++  }
+   device_ = gbm_create_device(fd_);
+   if (!device_)
+     return fail();
+-  surface_ = gbm_surface_create(device_, mode_.hdisplay, mode_.vdisplay,
+-                                GBM_FORMAT_ARGB8888,
++  surface_ = gbm_surface_create(device_, width_, height_, GBM_FORMAT_ARGB8888,
+                                 GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
+   if (!surface_)
+     return fail();
+-  fprintf(stderr, "coreelec-gbm: %dx%d mode %s\n", width(), height(),
+-          mode_.name);
++  fprintf(stderr, "coreelec-gbm: %dx%d mode %s%s\n", width_, height_,
++          mode_.name, fractional_ ? " (1000/1001)" : "");
+   return true;
+ }
+ 
++void CoreelecGbm::UseModes(const drmModeConnector &connector) {
++  modes_.assign(connector.modes, connector.modes + connector.count_modes);
++  std::vector<std::string> names;
++  for (const auto &mode : modes_) {
++    if (mode.hdisplay == width_ && mode.vdisplay == height_ &&
++        !(mode.flags & DRM_MODE_FLAG_INTERLACE))
++      names.push_back(mode.name);
++  }
++  std::lock_guard<std::mutex> lock(request_mutex_);
++  mode_names_ = std::move(names);
++}
++
++bool CoreelecGbm::RequestMode(const std::string &name, bool fractional) {
++  std::lock_guard<std::mutex> lock(request_mutex_);
++  if ((fractional && !fractional_property_) ||
++      std::find(mode_names_.begin(), mode_names_.end(), name) ==
++          mode_names_.end())
++    return false;
++  request_ = std::make_pair(name, fractional);
++  return true;
++}
++
++bool CoreelecGbm::SetFractional(bool fractional) {
++  if (!fractional_property_)
++    return false;
++  if (drmModeObjectSetProperty(fd_, connector_, DRM_MODE_OBJECT_CONNECTOR,
++                               fractional_property_, fractional ? 1 : 0)) {
++    perror("coreelec-gbm FRAC_RATE_POLICY");
++    return false;
++  }
++  fractional_ = fractional;
++  return true;
++}
++
++void CoreelecGbm::CheckDisplay(bool now) {
++  auto time = std::chrono::steady_clock::now();
++  if (!now && time < next_check_)
++    return;
++  next_check_ = time + std::chrono::seconds(1);
++  // The kernel updates the connector on hotplug; this does not probe again.
++  ConnectorPtr connector(drmModeGetConnectorCurrent(fd_, connector_),
++                         drmModeFreeConnector);
++  if (!connector || connector->connection != DRM_MODE_CONNECTED ||
++      connector->count_modes < 1) {
++    if (connected_) {
++      fprintf(stderr, "coreelec-gbm: display disconnected, waiting\n");
++      connected_ = false;
++      reported_no_mode_ = false;
++      Disable();
++    }
++    return;
++  }
++  UseModes(*connector);
++  std::vector<third_party::starboard::rdk::shared::coreelec::OutputMode>
++      outputs;
++  for (const auto &mode : modes_) {
++    outputs.push_back({mode.name, mode.hdisplay, mode.vdisplay,
++                       (mode.flags & DRM_MODE_FLAG_INTERLACE) != 0,
++                       static_cast<int>(mode.vrefresh)});
++  }
++  int chosen = third_party::starboard::rdk::shared::coreelec::ChooseOutputMode(
++      outputs, width_, height_, mode_.name);
++  if (chosen < 0) {
++    if (!reported_no_mode_)
++      fprintf(stderr, "coreelec-gbm: the display has no %dx%d mode, waiting\n",
++              width_, height_);
++    reported_no_mode_ = true;
++    if (connected_) {
++      connected_ = false;
++      Disable();
++    }
++    return;
++  }
++  const drmModeModeInfo &mode = modes_[chosen];
++  if (!connected_ || strcmp(mode.name, mode_.name) != 0) {
++    fprintf(stderr, "coreelec-gbm: display %s, showing %s\n",
++            connected_ ? "changed" : "back", mode.name);
++    mode_ = mode;
++    active_ = false; // the next frame sets the mode
++  }
++  connected_ = true;
++  reported_no_mode_ = false;
++}
++
+ uint32_t CoreelecGbm::Framebuffer(gbm_bo *buffer) {
+   auto found = framebuffers_.find(buffer);
+   if (found != framebuffers_.end())
+@@ -117,31 +224,91 @@ uint32_t CoreelecGbm::Framebuffer(gbm_bo *buffer) {
+   return id;
+ }
+ 
++void CoreelecGbm::Disable() {
++  if (fd_ >= 0 && active_)
++    drmModeSetCrtc(fd_, crtc_, 0, 0, 0, nullptr, 0, nullptr);
++  active_ = false;
++  // Drop a flip event that may still arrive for the old scanout.
++  drmEventContext events = {};
++  events.version = 2;
++  events.page_flip_handler = Flipped;
++  pollfd descriptor = {fd_, POLLIN, 0};
++  while (fd_ >= 0 && poll(&descriptor, 1, 0) > 0 && (descriptor.revents & POLLIN) &&
++         drmHandleEvent(fd_, &events) == 0) {
++  }
++  flip_waiting_ = false;
++  if (surface_) {
++    if (pending_)
++      gbm_surface_release_buffer(surface_, pending_);
++    if (front_)
++      gbm_surface_release_buffer(surface_, front_);
++  }
++  pending_ = front_ = nullptr;
++}
++
+ bool CoreelecGbm::Present() {
+   if (!surface_ || pending_)
+     return false;
++  CheckDisplay(false);
+   pending_ = gbm_surface_lock_front_buffer(surface_);
+   if (!pending_)
+     return false;
++  if (!connected_) {
++    // Nothing to show on: hand the frame back so Cobalt keeps rendering.
++    gbm_surface_release_buffer(surface_, pending_);
++    pending_ = nullptr;
++    return true;
++  }
+   uint32_t framebuffer = Framebuffer(pending_);
+   bool ok = framebuffer != 0;
++  std::optional<std::pair<std::string, bool>> request;
++  {
++    std::lock_guard<std::mutex> lock(request_mutex_);
++    request.swap(request_);
++  }
++  const drmModeModeInfo previous = mode_;
++  const bool was_active = active_;
++  bool switching = false;
++  if (ok && request) {
++    for (const auto &mode : modes_) {
++      if (request->first != mode.name || mode.hdisplay != width_ ||
++          mode.vdisplay != height_)
++        continue;
++      if (request->second == fractional_ || SetFractional(request->second)) {
++        mode_ = mode;
++        active_ = false; // a mode set instead of a flip
++        switching = true;
++      }
++      break;
++    }
++  }
+   if (ok && !active_) {
+     ok = drmModeSetCrtc(fd_, crtc_, framebuffer, 0, 0, &connector_, 1,
+                         &mode_) == 0;
+     active_ = ok;
+     if (ok)
+-      fprintf(stderr, "coreelec-gbm: first frame presented\n");
++      fprintf(stderr, "coreelec-gbm: showing %s%s\n", mode_.name,
++              fractional_ ? " (1000/1001)" : "");
++    else if (switching) {
++      // The old mode and buffer are still on screen: keep flipping on them.
++      perror("coreelec-gbm mode switch");
++      mode_ = previous;
++      active_ = was_active;
++      gbm_surface_release_buffer(surface_, pending_);
++      pending_ = nullptr;
++      return false;
++    }
+   } else if (ok) {
+-    bool waiting = true;
++    flip_waiting_ = true;
+     ok = drmModePageFlip(fd_, crtc_, framebuffer, DRM_MODE_PAGE_FLIP_EVENT,
+-                         &waiting) == 0;
++                         &flip_waiting_) == 0;
+     if (ok) {
+       drmEventContext events = {};
+       events.version = 2;
+       events.page_flip_handler = Flipped;
+       auto deadline =
+           std::chrono::steady_clock::now() + std::chrono::seconds(2);
+-      while (waiting) {
++      while (flip_waiting_) {
+         pollfd descriptor = {fd_, POLLIN, 0};
+         int ready = poll(&descriptor, 1, 100);
+         if (ready < 0 && errno == EINTR)
+@@ -150,8 +317,11 @@ bool CoreelecGbm::Present() {
+             (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) ||
+             (ready > 0 && drmHandleEvent(fd_, &events) != 0) ||
+             std::chrono::steady_clock::now() >= deadline) {
+-          // Keep both buffers locked until Close disables scanout.
++          // Usually the TV went away. Turn scanout off, which frees both
++          // buffers, and start again with a mode set once it is back.
+           fprintf(stderr, "coreelec-gbm: page flip did not complete\n");
++          Disable();
++          CheckDisplay(true);
+           return false;
+         }
+       }
+@@ -161,6 +331,7 @@ bool CoreelecGbm::Present() {
+     perror("coreelec-gbm present");
+     gbm_surface_release_buffer(surface_, pending_);
+     pending_ = nullptr;
++    CheckDisplay(true);
+     return false;
+   }
+   if (front_)
+@@ -171,26 +342,39 @@ bool CoreelecGbm::Present() {
+ }
+ 
+ void CoreelecGbm::Close() {
+-  if (fd_ >= 0 && active_)
+-    drmModeSetCrtc(fd_, crtc_, 0, 0, 0, nullptr, 0, nullptr);
++  // Leave the display as it was found, for Kodi.
++  if (fd_ >= 0 && fractional_ != start_fractional_)
++    SetFractional(start_fractional_);
++  if (fd_ >= 0 && active_ && front_ && strcmp(mode_.name, start_mode_.name)) {
++    uint32_t framebuffer = Framebuffer(front_);
++    if (framebuffer)
++      drmModeSetCrtc(fd_, crtc_, framebuffer, 0, 0, &connector_, 1,
++                     &start_mode_);
++  }
++  Disable();
+   for (const auto &item : framebuffers_)
+     drmModeRmFB(fd_, item.second);
+   framebuffers_.clear();
+-  if (surface_) {
+-    if (pending_)
+-      gbm_surface_release_buffer(surface_, pending_);
+-    if (front_)
+-      gbm_surface_release_buffer(surface_, front_);
++  if (surface_)
+     gbm_surface_destroy(surface_);
+-  }
+   if (device_)
+     gbm_device_destroy(device_);
+   if (fd_ >= 0)
+     close(fd_);
+   fd_ = -1;
+   connector_ = crtc_ = 0;
+-  active_ = false;
++  width_ = height_ = 0;
++  mode_ = start_mode_ = {};
++  modes_.clear();
++  fractional_property_ = 0;
++  start_fractional_ = fractional_ = false;
++  connected_ = true;
++  reported_no_mode_ = false;
++  {
++    std::lock_guard<std::mutex> lock(request_mutex_);
++    mode_names_.clear();
++    request_.reset();
++  }
+   device_ = nullptr;
+   surface_ = nullptr;
+-  front_ = pending_ = nullptr;
+ }
+diff --git a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_gbm.h b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_gbm.h
+index 75c1b4a3059..08f892a892e 100644
+--- a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_gbm.h
++++ b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_gbm.h
+@@ -2,10 +2,20 @@
+ #ifndef COREELEC_GBM_H_
+ #define COREELEC_GBM_H_
+ 
++#include <chrono>
+ #include <gbm.h>
+ #include <map>
++#include <mutex>
++#include <optional>
++#include <string>
++#include <utility>
++#include <vector>
+ #include <xf86drmMode.h>
+ 
++// The Cobalt window on a DRM display (CoreELEC Amlogic-no): GBM buffers shown
++// by page flips. It switches refresh rates for auto frame rate and keeps going
++// when the TV is unplugged, plugged in again or swapped. The window keeps the
++// size it opened with; the display only changes rate.
+ class CoreelecGbm {
+ public:
+   CoreelecGbm() = default;
+@@ -13,19 +23,44 @@ public:
+   CoreelecGbm(const CoreelecGbm &) = delete;
+   CoreelecGbm &operator=(const CoreelecGbm &) = delete;
+   bool Open();
++  // Back to the mode and 1000/1001 state the display had at Open, then off.
+   void Close();
+   bool Present();
++  // Switch to the same-size mode |name|, 1000/1001 slower when |fractional|,
++  // on the next frame. False when the display has no such mode. Any thread.
++  bool RequestMode(const std::string &name, bool fractional);
+   gbm_device *device() const { return device_; }
+   gbm_surface *surface() const { return surface_; }
+-  int width() const { return mode_.hdisplay; }
+-  int height() const { return mode_.vdisplay; }
++  int width() const { return width_; }
++  int height() const { return height_; }
+ 
+ private:
+   uint32_t Framebuffer(gbm_bo *buffer);
++  // Re-reads the connector (at most once a second unless |now|): stops showing
++  // frames when the TV is gone, picks a mode of the window's size when one is back.
++  void CheckDisplay(bool now);
++  void UseModes(const drmModeConnector &connector);
++  bool SetFractional(bool fractional);
++  // Turns scanout off and gives both buffers back to the surface.
++  void Disable();
+   int fd_ = -1;
+   uint32_t connector_ = 0;
+   uint32_t crtc_ = 0;
++  int width_ = 0;
++  int height_ = 0;
+   drmModeModeInfo mode_ = {};
++  drmModeModeInfo start_mode_ = {};
++  std::vector<drmModeModeInfo> modes_;
++  uint32_t fractional_property_ = 0;
++  bool start_fractional_ = false;
++  bool fractional_ = false;
++  bool connected_ = true;
++  bool reported_no_mode_ = false;
++  bool flip_waiting_ = false;
++  std::chrono::steady_clock::time_point next_check_{};
++  std::mutex request_mutex_;
++  std::vector<std::string> mode_names_;  // same-size modes, for RequestMode
++  std::optional<std::pair<std::string, bool>> request_;
+   gbm_device *device_ = nullptr;
+   gbm_surface *surface_ = nullptr;
+   gbm_bo *front_ = nullptr;
