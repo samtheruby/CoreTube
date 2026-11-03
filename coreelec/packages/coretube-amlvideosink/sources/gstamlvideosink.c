@@ -640,7 +640,7 @@ static GstFlowReturn write_av1(GstAmlVideoSink *self, const guint8 *data, gsize 
 static GstFlowReturn gst_aml_video_sink_render(GstBaseSink *bsink, GstBuffer *buffer)
 {
   GstAmlVideoSink *self = GST_AML_VIDEO_SINK(bsink);
-  GstClockTime running_time;
+  GstClockTime pts = GST_BUFFER_PTS(buffer), running_time;
   GstFlowReturn ret;
   GstMapInfo map;
 
@@ -649,7 +649,11 @@ static GstFlowReturn gst_aml_video_sink_render(GstBaseSink *bsink, GstBuffer *bu
 
   sync_hardware_clock(self, FALSE);
 
-  running_time = gst_segment_to_running_time(&bsink->segment, GST_FORMAT_TIME, GST_BUFFER_PTS(buffer));
+  /* Frames before the segment start lead from a keyframe up to a seek target. The
+   * decoder needs them, and timed at the start the hardware skips straight past them. */
+  if (GST_CLOCK_TIME_IS_VALID(pts) && pts < bsink->segment.start)
+    pts = bsink->segment.start;
+  running_time = gst_segment_to_running_time(&bsink->segment, GST_FORMAT_TIME, pts);
   if (GST_CLOCK_TIME_IS_VALID(running_time)) {
     self->last_pts = to_pts(running_time);
     if (amcodec.checkin_pts(&self->codec, self->last_pts) != 0)
@@ -836,6 +840,8 @@ static void gst_aml_video_sink_init(GstAmlVideoSink *self)
   gst_base_sink_set_ts_offset(bsink, -(GstClockTimeDiff)LEAD_TIME);
   gst_base_sink_set_max_lateness(bsink, -1);
   gst_base_sink_set_qos_enabled(bsink, FALSE);
+  /* Not even frames before the segment start: render() explains why. */
+  gst_base_sink_set_drop_out_of_segment(bsink, FALSE);
 }
 
 static gboolean plugin_init(GstPlugin *plugin)

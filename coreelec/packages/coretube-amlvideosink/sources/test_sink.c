@@ -10,9 +10,18 @@ static GByteArray *written;
 static int fake_write(codec_para_t *c, void *buf, int len) { (void)c; g_byte_array_append(written, buf, len); return len; }
 
 static int init_result, fake_vpts;
+static unsigned long checkins[4]; /* timestamps queued since the test cleared checkin_count */
+static guint checkin_count;
 static int fake_init(codec_para_t *c) { (void)c; return init_result; }
 static int fake_ok(codec_para_t *c) { (void)c; return 0; }
-static int fake_checkin(codec_para_t *c, unsigned long pts) { (void)c; (void)pts; return 0; }
+static int fake_checkin(codec_para_t *c, unsigned long pts)
+{
+  (void)c;
+  if (checkin_count < G_N_ELEMENTS(checkins))
+    checkins[checkin_count] = pts;
+  checkin_count++;
+  return 0;
+}
 static int fake_get_vpts(codec_para_t *c) { (void)c; return fake_vpts; }
 static int fake_set_int(codec_para_t *c, int v) { (void)c; (void)v; return 0; }
 static int fake_set_uint(codec_para_t *c, unsigned int v) { (void)c; (void)v; return 0; }
@@ -115,6 +124,45 @@ static void test_decoder_sysfs(void)
   gst_caps_unref(h264);
 }
 
+/* An accurate seek starts the segment at the target, but upstream sends frames from
+ * the keyframe before it, marked as Cobalt's RDK player marks them (decode only, 1/60 s
+ * long). The decoder needs them all, timed at the segment start. */
+static void test_seek_inside_gop(void)
+{
+  GstElement *sink = g_object_new(GST_TYPE_AML_VIDEO_SINK, "async", FALSE, NULL);
+  GstPad *pad = gst_element_get_static_pad(sink, "sink");
+  GstCaps *h264 = gst_caps_from_string(H264_CAPS ", width=1920, height=1080");
+  GstSegment segment;
+
+  g_object_set(sink, "rectangle", "100,100,640,360", NULL);
+  assert(gst_element_set_state(sink, GST_STATE_PLAYING) == GST_STATE_CHANGE_SUCCESS);
+  assert(gst_pad_send_event(pad, gst_event_new_stream_start("seek")));
+  assert(gst_pad_send_event(pad, gst_event_new_caps(h264)));
+  gst_segment_init(&segment, GST_FORMAT_TIME);
+  segment.start = segment.time = segment.position = 5 * GST_SECOND;
+  assert(gst_pad_send_event(pad, gst_event_new_segment(&segment)));
+
+  g_byte_array_set_size(written, 0);
+  checkin_count = 0;
+  for (GstClockTime pts = 4267 * GST_MSECOND; pts <= 5 * GST_SECOND; pts += 733 * GST_MSECOND) {
+    GstBuffer *buf = gst_buffer_new_wrapped(g_memdup2("\0\0\0\1", 4), 4);
+
+    GST_BUFFER_PTS(buf) = pts;
+    GST_BUFFER_DURATION(buf) = GST_SECOND / 60;
+    if (pts < segment.start)
+      GST_BUFFER_FLAG_SET(buf, GST_BUFFER_FLAG_DECODE_ONLY);
+    assert(gst_pad_chain(pad, buf) == GST_FLOW_OK);
+  }
+  assert(written->len == 8);               /* the keyframe at 4.267 s reached the decoder */
+  assert(checkin_count == 2);              /* timed at the target, so it never shows before it */
+  assert(checkins[0] == to_pts(0) && checkins[1] == to_pts(0));
+
+  gst_element_set_state(sink, GST_STATE_NULL);
+  gst_object_unref(pad);
+  gst_object_unref(sink);
+  gst_caps_unref(h264);
+}
+
 /* The S922Z box's vcodec_profile (excerpt), and one with AV1 hardware. */
 static const char *g12b = "h264:4k;\nhevc:8k, 8bit, 10bit, dwrite, compressed, frame_dv, fence;\nav1_unsupport:;\nmav1:;\nvp9:8k, 10bit, dwrite, compressed, fence;\n";
 static const char *s905x4 = "h264:4k;\nav1:4k, 10bit, dwrite, compressed;\nvp9:4k, 10bit;\n";
@@ -169,6 +217,7 @@ int main(void)
   assert(strcmp(c, "HDRStaticInfo:1;mR.x:35400;mR.y:14600;mG.x:8500;mG.y:39850;mB.x:6550;mB.y:2300;"
                    "mW.x:15635;mW.y:16450;mMaxDL:10000000;mMinDL:50;mCLLPresent:1;mMaxCLL:1000;mMaxFALL:400;mTransfer:16") == 0);
   test_decoder_sysfs();
+  test_seek_inside_gop();
   g_print("all sink tests passed\n");
   return 0;
 }
