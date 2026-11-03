@@ -6,8 +6,22 @@
 # Runs after Cobalt ends, before Kodi starts again (see default.py). The video
 # sink mutes the HDMI output while a video starts; if Cobalt crashed in that
 # moment, the mute is still on and Kodi would come back to a black screen.
-mute=/sys/class/amhdmitx/amhdmitx0/vid_mute
+root=${TIZENTUBE_ROOT:-}  # tests point /sys and /run at a fake tree
+mute=${root}/sys/class/amhdmitx/amhdmitx0/vid_mute
 if [ -w "${mute}" ] && [ "$(cat "${mute}")" != 0 ]; then
   echo 0 > "${mute}"
+fi
+
+# Auto frame rate may have left the TV at another refresh rate; Kodi expects the
+# mode it had (saved by tizentube-start).
+state=${root}/run/tizentube-display-state
+mode=${root}/sys/class/display/mode
+frac=${root}/sys/class/amhdmitx/amhdmitx0/frac_rate_policy
+if [ -r "${state}" ] && read -r saved_mode saved_frac < "${state}"; then
+  if [ "$(cat "${mode}")" != "${saved_mode}" ] || [ "$(cat "${frac}")" != "${saved_frac}" ]; then
+    echo "${saved_frac}" > "${frac}"
+    echo "${saved_mode}" > "${mode}"
+  fi
+  rm -f "${state}"
 fi
 exit 0
