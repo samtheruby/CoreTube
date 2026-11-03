@@ -1,0 +1,29 @@
+alsasink: report the IEC 61937 delay in ring buffer samples
+
+snd_pcm_delay() counts ALSA frames, 4 bytes each for an IEC 61937 stream,
+while the ring buffer counts samples of the stream's bytes per frame: 16 for
+E-AC3 (192 kHz bursts carrying 48 kHz audio). The delay went to the ring
+buffer unconverted, 4 times too large for E-AC3, so the audio clock ran up to
+the whole device buffer late and jumped by most of a period at each write:
+video synced to it played out of sync after a seek and juddered.
+Scale the delay by the ALSA frame size over the stream's bytes per frame.
+
+--- a/ext/alsa/gstalsasink.c
++++ b/ext/alsa/gstalsasink.c
+@@ -1209,6 +1209,16 @@
+     delay = 0;
+   }
+ 
++  /* ALSA counts frames of alsa->bpf bytes; the ring buffer counts samples of
++   * the stream's bytes per frame (16 for E-AC3 bursts sent as 4-byte frames). */
++  if (alsa->iec958) {
++    GstAudioRingBuffer *rb = GST_AUDIO_BASE_SINK (asink)->ringbuffer;
++    gint spec_bpf = rb ? GST_AUDIO_INFO_BPF (&rb->spec.info) : 0;
++
++    if (spec_bpf > 0)
++      delay = delay * alsa->bpf / spec_bpf;
++  }
++
+   return delay;
+ }
+ 
