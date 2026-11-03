@@ -22,7 +22,8 @@ typedef struct {
 typedef struct AmlPresenter AmlPresenter;
 
 AmlPresenter *aml_presenter_new(const AmlPresenterOps *ops, void *ctx);
-/* Frame timestamps (stream time in us + 1, 0 = none) map to running time by this segment. */
+/* Frame timestamps (stream time in us + 1; 0 = none, which amlvideo also gives for a
+ * frame at stream time 0) map to running time by this segment. */
 void aml_presenter_set_segment(AmlPresenter *p, const GstSegment *segment);
 /* Starts the thread; also after a flush. */
 void aml_presenter_start(AmlPresenter *p);

@@ -718,8 +718,9 @@ static void test_shown_callback_once_per_start(void)
   fake_video_free(f);
 }
 
-/* amlvideo gives the first frame after the decoder opens no timestamp (pts 0). It
- * takes the segment start, so it is shown, not dropped as before the segment. */
+/* A frame checked in at stream time 0 (as 1) comes back from amlvideo with pts 0,
+ * which also means "none". It takes the segment start, so it is shown, not dropped
+ * as before the segment. */
 static void test_frame_without_pts_is_shown(void)
 {
   FakeVideo *f = fake_video_new();
