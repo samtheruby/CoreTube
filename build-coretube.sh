@@ -53,18 +53,18 @@ while [ $# -gt 0 ]; do
 done
 
 # test mode may run without --arch.
-tag="" image="" ce_url="" ce_commit="" ce_device="" ce_subdir="" triple="" cc_flags=""
+image="" ce_url="" ce_commit="" ce_device="" ce_subdir="" triple="" cc_flags=""
 platform="" stock="" sysroot_arch="" legacy=""
 case $arch in
   arm)
-    tag=ng image=coretube-ng ce_url=$COREELEC_NG_URL ce_commit=$COREELEC_NG_COMMIT
+    image=coretube-ng ce_url=$COREELEC_NG_URL ce_commit=$COREELEC_NG_COMMIT
     ce_device=Amlogic-ng ce_subdir=build.CoreELEC-Amlogic-ng.arm-21
     triple=armv8a-libreelec-linux-gnueabihf cc_flags=""
     platform=evergreen-arm-hardfp-coreelec stock=evergreen-arm-hardfp sysroot_arch=arm
     # Engine of the earlier RDK-SDK builds; same ARM hard-float ABI, reused if present.
     legacy=evergreen-arm-hardfp-rdk ;;
   aarch64)
-    tag=no image=coretube-no ce_url=$COREELEC_NO_URL ce_commit=$COREELEC_NO_COMMIT
+    image=coretube-no ce_url=$COREELEC_NO_URL ce_commit=$COREELEC_NO_COMMIT
     ce_device=Amlogic-no ce_subdir=build.CoreELEC-Amlogic-no.aarch64-22
     triple=aarch64-libreelec-linux-gnu cc_flags="-fuse-ld=gold"
     platform=evergreen-arm64-coreelec stock=evergreen-arm64 sysroot_arch=arm64 legacy="" ;;
@@ -89,10 +89,10 @@ work_dir=$(realpath -m "$work_dir")
 
 version=$(python3 -I -c 'import sys, xml.etree.ElementTree as E; print(E.parse(sys.argv[1]).getroot().get("version"))' "$repo/addon/addon.xml")
 zip_file=$repo/out/$arch/browser.tizentube-$version.zip
-# The CoreELEC checkout lives in the build folder: the packages step, which runs as
-# that folder's owner, is the only one that writes it.
-ce=$build_dir/coretube/coreelec-$tag
 ce_build=$build_dir/$ce_subdir
+# The CoreELEC checkout lives in CoreELEC's own build folder: the packages step,
+# which runs as that folder's owner, is the only one that writes it.
+ce=$ce_build/coretube-coreelec
 src=$cobalt_dir/src
 out=$src/out/${platform}_qa
 
@@ -115,16 +115,36 @@ ensure_image() {
 }
 
 # owner IMAGE DIR: uid:gid of a host folder, read inside a container.
-owner() { docker run --rm -v "$(map_path "$2")":/d "$1" stat -c %u:%g /d; }
+# step_folder STEP: "ROOT SUB" - the step runs as the owner of ROOT/SUB, or of ROOT
+# while SUB does not exist yet, and writes only there. A build folder can be a
+# share owned by someone else that holds CoreELEC's own folder (build.CoreELEC-*).
+step_folder() {
+  case $1 in
+    packages) echo "$build_dir $ce_subdir" ;; cobalt) echo "$cobalt_dir ." ;;
+    zip) echo "$repo out" ;; *) echo "$work_dir ." ;;
+  esac
+}
+
+# owner_folder STEP: that folder, as this shell sees it (for --dry-run).
+owner_folder() {
+  local root sub
+  read -r root sub <<< "$(step_folder "$1")"
+  if [ "$sub" != . ] && [ -d "$root/$sub" ]; then echo "$root/$sub"; else echo "$root"; fi
+}
+
+# owner IMAGE STEP: uid:gid of that folder, read inside a container (it may be a
+# host path this shell cannot see).
+owner() {
+  local root sub
+  read -r root sub <<< "$(step_folder "$2")"
+  docker run --rm -v "$(map_path "$root")":/d "$1" sh -c 'stat -c %u:%g "/d/$1" 2>/dev/null || stat -c %u:%g /d' _ "$sub"
+}
 
 in_docker() {
-  local step=$1 user dir
-  case $step in
-    packages) dir=$build_dir ;; cobalt) dir=$cobalt_dir ;; zip) dir=$repo ;; *) dir=$work_dir ;;
-  esac
-  user=$(owner "$image" "$dir")
+  local step=$1 user
+  user=$(owner "$image" "$step")
   [ "$step" != packages ] || [ "${user%%:*}" != 0 ] ||
-    die "$build_dir belongs to root; CoreELEC refuses to build as root (chown it to your user)"
+    die "$ce_build (or $build_dir) belongs to root; CoreELEC refuses to build as root (chown it to your user)"
   local -a extra=()
   [ "$allow_rebuild" = 0 ] || extra+=(--allow-rebuild)
   echo "== $step (docker $image, user $user)"
@@ -320,11 +340,11 @@ if [ "$mode" = test ]; then run_tests; exit; fi
 steps=${only:-$all_steps}
 if [ "$dry_run" = 1 ]; then
   echo "arch $arch: CoreELEC $ce_device $ce_url @ ${ce_commit:0:12}, image $image"
-  echo "step sources: helper tooling (writes $work_dir/tooling)"
-  echo "step packages: CoreELEC checkout $ce, $packages into $ce_build, stamps checked, --allow-rebuild=$allow_rebuild (writes $build_dir)"
-  echo "step cobalt: $src at ${COBALT_COMMIT:0:12} + cobalt/patches, $platform qa, engine from $platform, $stock${legacy:+ or $legacy} (writes $cobalt_dir)"
-  echo "step helper: android-drm-helper (writes $work_dir/$arch)"
-  echo "step zip: $zip_file (writes $repo/out)"
+  echo "step sources: helper tooling (as owner of $(owner_folder sources); writes $work_dir/tooling)"
+  echo "step packages: CoreELEC checkout $ce, $packages, stamps checked, --allow-rebuild=$allow_rebuild (as owner of $(owner_folder packages); writes $ce_build)"
+  echo "step cobalt: $src at ${COBALT_COMMIT:0:12} + cobalt/patches, $platform qa, engine from $platform, $stock${legacy:+ or $legacy} (as owner of $(owner_folder cobalt); writes $cobalt_dir)"
+  echo "step helper: android-drm-helper (as owner of $(owner_folder helper); writes $work_dir/$arch)"
+  echo "step zip: $zip_file (as owner of $(owner_folder zip); writes $repo/out)"
   echo "jobs: $jobs"
   exit 0
 fi

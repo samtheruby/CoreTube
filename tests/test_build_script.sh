@@ -42,15 +42,25 @@ for want in coretube-no build.CoreELEC-Amlogic-no.aarch64-22 evergreen-arm64-cor
 done
 [ ! -e "$tmp/work" ] || fail "--dry-run created the work folder"
 
-# With --docker each step runs as the owner of one folder, so it may write only there.
-for pair in "sources:$tmp/work" "packages:$tmp/build" "cobalt:$tmp/cobalt" "helper:$tmp/work" "zip:$repo/out"; do
-  step=${pair%%:*} dir=${pair#*:}
-  writes=$(echo "$out" | sed -n "s/^step $step:.*(writes \(.*\))\$/\1/p")
-  [ -n "$writes" ] || fail "$step does not say what it writes: $out"
+# With --docker each step runs as the owner of one folder and may write only there.
+# check_owner PLAN STEP DIR: STEP runs as DIR's owner and writes nothing outside DIR.
+check_owner() {
+  as=$(echo "$1" | sed -n "s/^step $2:.*(as owner of \([^;]*\); writes .*)\$/\1/p")
+  writes=$(echo "$1" | sed -n "s/^step $2:.*; writes \(.*\))\$/\1/p")
+  [ "$as" = "$3" ] || fail "$2 runs as owner of '$as', want $3: $1"
+  [ -n "$writes" ] || fail "$2 does not say what it writes: $1"
   for w in $writes; do
-    case $w in "$dir" | "$dir"/*) ;; *) fail "$step writes $w, outside $dir" ;; esac
+    case $w in "$3" | "$3"/*) ;; *) fail "$2 writes $w, outside $3" ;; esac
   done
+}
+zip_owner=$repo; [ ! -d "$repo/out" ] || zip_owner=$repo/out
+for pair in "sources:$tmp/work" "packages:$tmp/build" "cobalt:$tmp/cobalt" "helper:$tmp/work" "zip:$zip_owner"; do
+  check_owner "$out" "${pair%%:*}" "${pair#*:}"
 done
+# A build folder that is a share (owned by someone else) holding the user's CoreELEC
+# folder: the packages step runs as the owner of the CoreELEC folder it writes.
+mkdir "$tmp/build/build.CoreELEC-Amlogic-ng.arm-21"
+check_owner "$(plan arm)" packages "$tmp/build/build.CoreELEC-Amlogic-ng.arm-21"
 
 # Default parallel jobs: 75% of the CPUs, at least one.
 want=$(( $(nproc) * 3 / 4 )); [ "$want" -ge 1 ] || want=1
