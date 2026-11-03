@@ -31,7 +31,7 @@ void aml_presenter_flush(AmlPresenter *p);
 /* Paused, only the first frame after a start shows (the preroll picture). */
 void aml_presenter_set_playing(AmlPresenter *p, gboolean playing);
 /* Waits until the frame with this timestamp (or a later one) was shown or dropped, at
- * most timeout_us. Returns the timestamp of the last frame shown, 0 for none. */
+ * most timeout_us. Returns the highest timestamp shown or dropped since start, 0 for none. */
 guint64 aml_presenter_wait_shown(AmlPresenter *p, guint64 pts_us, gint64 timeout_us);
 /* Called from the thread on the first frame shown after each start. */
 void aml_presenter_set_shown_callback(AmlPresenter *p, void (*callback)(gpointer), gpointer data);

@@ -32,7 +32,7 @@ struct AmlPresenter {
   guint n_held;
   gboolean shown_since_start;
   GstClockTime last_stream; /* stream time of the last frame taken, for frames without one */
-  guint64 last_shown_pts, handled_pts;
+  guint64 handled_pts; /* highest timestamp shown or dropped since start */
   gint64 intervals[AML_PACER_VSYNC_SAMPLES];
   guint n_intervals;
   gint64 last_vsync;
@@ -63,8 +63,6 @@ static void hand_back(AmlPresenter *p, const HeldFrame *frame, gboolean drop)
 {
   if (p->ops->queue(p->ctx, frame->index, drop) < 0)
     GST_WARNING("cannot hand back buffer %u", frame->index);
-  if (!drop)
-    p->last_shown_pts = frame->pts_us;
   p->handled_pts = MAX(p->handled_pts, frame->pts_us);
 }
 
@@ -215,7 +213,7 @@ void aml_presenter_flush(AmlPresenter *p)
   for (guint i = 0; i < p->n_held; i++)
     hand_back(p, &p->held[i], TRUE);
   p->n_held = 0;
-  p->last_shown_pts = p->handled_pts = 0;
+  p->handled_pts = 0;
   g_mutex_unlock(&p->lock);
 }
 
@@ -229,14 +227,14 @@ void aml_presenter_set_playing(AmlPresenter *p, gboolean playing)
 guint64 aml_presenter_wait_shown(AmlPresenter *p, guint64 pts_us, gint64 timeout_us)
 {
   gint64 deadline = g_get_monotonic_time() + timeout_us;
-  guint64 shown;
+  guint64 handled;
 
   g_mutex_lock(&p->lock);
   while (p->running && p->handled_pts < pts_us && g_cond_wait_until(&p->handled_cond, &p->lock, deadline))
     ;
-  shown = p->last_shown_pts;
+  handled = p->handled_pts;
   g_mutex_unlock(&p->lock);
-  return shown;
+  return handled;
 }
 
 void aml_presenter_set_shown_callback(AmlPresenter *p, void (*callback)(gpointer), gpointer data)

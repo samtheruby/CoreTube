@@ -11,12 +11,12 @@
 static GByteArray *written;
 static int fake_write(codec_para_t *c, void *buf, int len) { (void)c; g_byte_array_append(written, buf, len); return len; }
 
-static int init_result, fake_vpts;
-static unsigned long checkins[4]; /* timestamps queued since the test cleared checkin_count */
+static int init_result, init_video_path = -1;
+static guint64 checkins[4]; /* timestamps queued since the test cleared checkin_count */
 static guint checkin_count;
-static int fake_init(codec_para_t *c) { (void)c; return init_result; }
+static int fake_init(codec_para_t *c) { init_video_path = c->video_path; return init_result; }
 static int fake_ok(codec_para_t *c) { (void)c; return 0; }
-static int fake_checkin(codec_para_t *c, unsigned long pts)
+static int fake_checkin(codec_para_t *c, guint64 pts)
 {
   (void)c;
   if (checkin_count < G_N_ELEMENTS(checkins))
@@ -24,9 +24,42 @@ static int fake_checkin(codec_para_t *c, unsigned long pts)
   checkin_count++;
   return 0;
 }
-static int fake_get_vpts(codec_para_t *c) { (void)c; return fake_vpts; }
 static int fake_set_int(codec_para_t *c, int v) { (void)c; (void)v; return 0; }
-static int fake_set_uint(codec_para_t *c, unsigned int v) { (void)c; (void)v; return 0; }
+
+/* amlvideo for the sink tests: free-running vsyncs, no pipeline clock (so only the
+ * preroll picture shows), and the frames the test says the decoder put out. */
+static GMutex sink_video_lock;
+static guint64 sink_video_pts[8];
+static guint sink_video_ready, sink_video_index;
+static int sink_video_poll(void *ctx, int timeout_ms) { (void)ctx; (void)timeout_ms; g_usleep(2000); return 1; }
+static int sink_video_dequeue(void *ctx, guint *index, guint64 *pts_us)
+{
+  int ret = -EAGAIN;
+
+  (void)ctx;
+  g_mutex_lock(&sink_video_lock);
+  if (sink_video_ready) {
+    *pts_us = sink_video_pts[0];
+    *index = sink_video_index++;
+    memmove(sink_video_pts, sink_video_pts + 1, sizeof(sink_video_pts) - sizeof(sink_video_pts[0]));
+    sink_video_ready--;
+    ret = 0;
+  }
+  g_mutex_unlock(&sink_video_lock);
+  return ret;
+}
+static int sink_video_queue(void *ctx, guint index, gboolean drop) { (void)ctx; (void)index; (void)drop; return 0; }
+static gint64 sink_video_running(void *ctx) { (void)ctx; return -1; }
+static gint64 sink_video_now(void *ctx) { (void)ctx; return g_get_monotonic_time(); }
+static const AmlPresenterOps sink_video_ops = {sink_video_poll, sink_video_dequeue, sink_video_queue,
+                                               sink_video_running, sink_video_now};
+
+static void sink_video_decoded(guint64 pts_us)
+{
+  g_mutex_lock(&sink_video_lock);
+  sink_video_pts[sink_video_ready++] = pts_us;
+  g_mutex_unlock(&sink_video_lock);
+}
 
 static void put(const char *path, const char *value)
 {
@@ -48,6 +81,22 @@ static gboolean is(const char *path, const char *want)
   return same;
 }
 
+/* is(), waiting up to a second for another thread to write the value. */
+static gboolean becomes(const char *path, const char *want)
+{
+  gchar *full = g_strconcat(SYSFS_ROOT, path, NULL), *got = NULL;
+  gboolean same = FALSE;
+
+  for (int i = 0; i < 100 && !same; i++, g_usleep(10000)) {
+    g_free(got);
+    got = NULL;
+    same = g_file_get_contents(full, &got, NULL, NULL) && strcmp(g_strstrip(got), want) == 0;
+  }
+  g_free(got);
+  g_free(full);
+  return same || is(path, want);
+}
+
 static void render_at(GstAmlVideoSink *sink, GstClockTime pts)
 {
   GstBuffer *buf = gst_buffer_new_allocate(NULL, 4, NULL);
@@ -59,6 +108,8 @@ static void render_at(GstAmlVideoSink *sink, GstClockTime pts)
 #define BLACKOUT "/sys/class/video/blackout_policy"
 #define MUTE "/sys/class/amhdmitx/amhdmitx0/vid_mute"
 #define DISABLE "/sys/class/video/disable_video"
+#define TSYNC "/sys/class/tsync/enable"
+#define FREERUN "/sys/class/video/freerun_mode"
 
 /* Opening and closing the decoder: blackout_policy and the screen mute. */
 static void test_decoder_sysfs(void)
@@ -71,34 +122,26 @@ static void test_decoder_sysfs(void)
   put(DISABLE, "0\n");
   put("/sys/class/graphics/fb0/free_scale_axis", "0 0 1919 1079\n");
   put("/sys/class/graphics/fb0/window_axis", "0 0 3839 2159\n");
-  amcodec.init = fake_init;
-  amcodec.close = amcodec.reset = amcodec.pause = amcodec.resume = fake_ok;
-  amcodec.checkin_pts = fake_checkin;
-  amcodec.get_vpts = fake_get_vpts;
-  amcodec.set_freerun_mode = fake_set_uint;
-  amcodec.set_eos = amcodec.set_pcrscr = fake_set_int;
-  amcodec.get_pcrscr = fake_ok;
 
   sink = g_object_new(GST_TYPE_AML_VIDEO_SINK, NULL);
   gst_segment_init(&GST_BASE_SINK(sink)->segment, GST_FORMAT_TIME);
 
   /* Fullscreen video: the kernel must not keep the last frame, and the screen is
-   * muted until the decoder shows the first frame queued. */
+   * muted until the first decoded frame is shown. */
   g_object_set(sink, "rectangle", "0,0,1920,1080", NULL);
-  fake_vpts = 0;
   assert(open_decoder(sink, h264));
   assert(is(BLACKOUT, "1") && is(MUTE, "1") && is(DISABLE, "2"));
   render_at(sink, GST_SECOND);
-  assert(is(MUTE, "1"));                  /* nothing shown yet */
-  fake_vpts = (int)to_pts(GST_SECOND);
-  render_at(sink, 2 * GST_SECOND);
-  assert(is(MUTE, "0"));                  /* first frame shown */
+  g_usleep(50 * 1000);
+  assert(is(MUTE, "1"));                  /* nothing decoded yet */
+  sink_video_decoded(1000001);
+  assert(becomes(MUTE, "0"));             /* first frame shown */
 
-  /* A seek mutes again; a decoder clock left over from before does not count as shown. */
-  fake_vpts = 5000000;
+  /* A seek mutes again until a frame decoded after it shows. */
   gst_aml_video_sink_event(GST_BASE_SINK(sink), gst_event_new_flush_stop(TRUE));
   assert(is(MUTE, "1"));
   render_at(sink, GST_SECOND);
+  g_usleep(50 * 1000);
   assert(is(MUTE, "1"));
   g_usleep(400 * 1000);                   /* the timeout unmutes */
   assert(is(MUTE, "0"));
@@ -122,6 +165,84 @@ static void test_decoder_sysfs(void)
   assert(is(BLACKOUT, "0") && is(MUTE, "0"));
   init_result = 0;
 
+  gst_object_unref(sink);
+  gst_caps_unref(h264);
+}
+
+/* The decoder puts frames out on amlvideo, the hardware clock (tsync) is off, and the
+ * video layer shows each frame as soon as it is queued (freerun); closing restores both. */
+static void test_open_uses_amlvideo_path(void)
+{
+  GstCaps *h264 = gst_caps_from_string("video/x-h264, width=1920, height=1080");
+  GstAmlVideoSink *sink = g_object_new(GST_TYPE_AML_VIDEO_SINK, NULL);
+
+  put(TSYNC, "1\n");
+  put(FREERUN, "0\n");
+  g_object_set(sink, "rectangle", "100,100,640,360", NULL);
+  assert(open_decoder(sink, h264));
+  assert(init_video_path == FRAME_BASE_PATH_AMLVIDEO_AMVIDEO);
+  assert(is(TSYNC, "0") && is(FREERUN, "1"));
+  close_decoder(sink);
+  assert(is(TSYNC, "1") && is(FREERUN, "0"));
+
+  /* Without amlvideo there is no way to show frames: the open fails. */
+  assert(remove(SYSFS_ROOT "/dev/video10") == 0);
+  assert(!open_decoder(sink, h264));
+  put("/dev/video10", "");
+
+  gst_object_unref(sink);
+  gst_caps_unref(h264);
+}
+
+/* Timestamps go to the decoder as the frame's own time in us (+1, as 0 means none);
+ * the presenter maps them to running time with the segment. */
+static void test_checkin_is_stream_time_us(void)
+{
+  GstCaps *h264 = gst_caps_from_string("video/x-h264, width=1920, height=1080");
+  GstAmlVideoSink *sink = g_object_new(GST_TYPE_AML_VIDEO_SINK, NULL);
+  GstSegment *segment = &GST_BASE_SINK(sink)->segment;
+
+  gst_segment_init(segment, GST_FORMAT_TIME);
+  g_object_set(sink, "rectangle", "100,100,640,360", NULL);
+  assert(open_decoder(sink, h264));
+  checkin_count = 0;
+  render_at(sink, 2500 * GST_MSECOND);
+  segment->start = segment->time = 5 * GST_SECOND;
+  render_at(sink, 7 * GST_SECOND);
+  assert(checkin_count == 2 && checkins[0] == 2500001 && checkins[1] == 7000001);
+  close_decoder(sink);
+  gst_object_unref(sink);
+  gst_caps_unref(h264);
+}
+
+/* The hardware clock stays off through playing, a seek and a pause. */
+static void test_hardware_clock_stays_off(void)
+{
+  GstElement *sink = g_object_new(GST_TYPE_AML_VIDEO_SINK, "async", FALSE, NULL);
+  GstPad *pad = gst_element_get_static_pad(sink, "sink");
+  GstCaps *h264 = gst_caps_from_string(H264_CAPS ", width=1920, height=1080");
+  GstSegment segment;
+  GstBuffer *buf = gst_buffer_new_wrapped(g_memdup2("\0\0\0\1", 4), 4);
+
+  put(TSYNC, "1\n");
+  g_object_set(sink, "rectangle", "100,100,640,360", NULL);
+  assert(gst_element_set_state(sink, GST_STATE_PLAYING) == GST_STATE_CHANGE_SUCCESS);
+  assert(gst_pad_send_event(pad, gst_event_new_stream_start("clock")));
+  assert(gst_pad_send_event(pad, gst_event_new_caps(h264)));
+  gst_segment_init(&segment, GST_FORMAT_TIME);
+  assert(gst_pad_send_event(pad, gst_event_new_segment(&segment)));
+  GST_BUFFER_PTS(buf) = 0;
+  assert(gst_pad_chain(pad, buf) == GST_FLOW_OK);
+  assert(is(TSYNC, "0"));
+  assert(gst_pad_send_event(pad, gst_event_new_flush_start()));
+  assert(gst_pad_send_event(pad, gst_event_new_flush_stop(TRUE)));
+  assert(is(TSYNC, "0"));
+  gst_element_set_state(sink, GST_STATE_PAUSED);
+  gst_element_set_state(sink, GST_STATE_PLAYING);
+  assert(is(TSYNC, "0"));
+  gst_element_set_state(sink, GST_STATE_NULL);
+  assert(is(TSYNC, "1"));
+  gst_object_unref(pad);
   gst_object_unref(sink);
   gst_caps_unref(h264);
 }
@@ -156,8 +277,8 @@ static void test_seek_inside_gop(void)
     assert(gst_pad_chain(pad, buf) == GST_FLOW_OK);
   }
   assert(written->len == 8);               /* the keyframe at 4.267 s reached the decoder */
-  assert(checkin_count == 2);              /* timed at the target, so it never shows before it */
-  assert(checkins[0] == to_pts(0) && checkins[1] == to_pts(0));
+  assert(checkin_count == 2);              /* its own time: the presenter drops it, it never shows */
+  assert(checkins[0] == 4267001 && checkins[1] == 5000001);
 
   gst_element_set_state(sink, GST_STATE_NULL);
   gst_object_unref(pad);
@@ -208,7 +329,7 @@ static void test_preroll_after_seek(void)
   thread = g_thread_new("before", push_buffers, pad);
   g_usleep(300 * 1000);
   assert(written->len == 8);               /* both reached the decoder without blocking */
-  assert(checkin_count == 2 && checkins[0] == to_pts(0) && checkins[1] == to_pts(0));
+  assert(checkin_count == 2 && checkins[0] == 4267001 && checkins[1] == 4300001);
   assert(gst_element_get_state(sink, NULL, NULL, 0) == GST_STATE_CHANGE_ASYNC); /* no preroll yet */
   gst_element_set_state(sink, GST_STATE_READY); /* unblocks the thread if it hangs */
   g_thread_join(thread);
@@ -218,8 +339,13 @@ static void test_preroll_after_seek(void)
   assert(gst_pad_send_event(pad, gst_event_new_caps(h264)));
   assert(gst_pad_send_event(pad, gst_event_new_segment(&segment)));
   g_object_set_data(G_OBJECT(pad), "pts", target);
+  g_byte_array_set_size(written, 0);
   thread = g_thread_new("target", push_buffers, pad);
   assert(gst_element_get_state(sink, NULL, NULL, GST_SECOND) == GST_STATE_CHANGE_SUCCESS);
+  assert(written->len == 4);               /* paused, the target frame is decoded for the preroll picture */
+  gst_element_set_state(sink, GST_STATE_PLAYING);
+  g_usleep(100 * 1000);
+  assert(written->len == 4);               /* and not sent again when playing starts */
 
   gst_element_set_state(sink, GST_STATE_NULL);
   g_thread_join(thread);
@@ -625,6 +751,25 @@ static void test_wait_shown(void)
   fake_video_free(f);
 }
 
+/* A last frame that is dropped (here: before the segment) also ends the wait, with its
+ * timestamp, so end of stream does not wait out the timeout. */
+static void test_wait_shown_counts_dropped_frames(void)
+{
+  FakeVideo *f = fake_video_new();
+  GstSegment segment;
+
+  gst_segment_init(&segment, GST_FORMAT_TIME);
+  segment.start = segment.time = 10 * GST_SECOND;
+  aml_presenter_set_segment(f->presenter, &segment);
+  decoded(f, 0, 9000001);
+  play(f, 0);
+  aml_presenter_start(f->presenter);
+  tick(f, 1, TRUE);
+  assert(count_queued(f, 0, TRUE) == 1);
+  assert(aml_presenter_wait_shown(f->presenter, 9000001, 0) == 9000001);
+  fake_video_free(f);
+}
+
 /* The S922Z box's vcodec_profile (excerpt), and one with AV1 hardware. */
 static const char *g12b = "h264:4k;\nhevc:8k, 8bit, 10bit, dwrite, compressed, frame_dv, fence;\nav1_unsupport:;\nmav1:;\nvp9:8k, 10bit, dwrite, compressed, fence;\n";
 static const char *s905x4 = "h264:4k;\nav1:4k, 10bit, dwrite, compressed;\nvp9:4k, 10bit;\n";
@@ -678,7 +823,16 @@ int main(void)
   g_print("%s\n", c);
   assert(strcmp(c, "HDRStaticInfo:1;mR.x:35400;mR.y:14600;mG.x:8500;mG.y:39850;mB.x:6550;mB.y:2300;"
                    "mW.x:15635;mW.y:16450;mMaxDL:10000000;mMinDL:50;mCLLPresent:1;mMaxCLL:1000;mMaxFALL:400;mTransfer:16") == 0);
+  amcodec.init = fake_init;
+  amcodec.close = amcodec.reset = amcodec.pause = fake_ok;
+  amcodec.checkin_pts_us64 = fake_checkin;
+  amcodec.set_eos = fake_set_int;
+  presenter_ops = &sink_video_ops;
+  put("/dev/video10", "");
   test_decoder_sysfs();
+  test_open_uses_amlvideo_path();
+  test_checkin_is_stream_time_us();
+  test_hardware_clock_stays_off();
   test_seek_inside_gop();
   test_preroll_after_seek();
   test_cadence_24_on_60();
@@ -695,6 +849,7 @@ int main(void)
   test_shown_callback_once_per_start();
   test_frame_without_pts_is_shown();
   test_wait_shown();
+  test_wait_shown_counts_dropped_frames();
   g_print("all sink tests passed\n");
   return 0;
 }

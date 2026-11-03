@@ -4,22 +4,31 @@
 /*
  * amlvideosink hands compressed H.264/H.265/VP9/AV1 frames (the ones the kernel's
  * decoder lists in vcodec_profile) to the Amlogic hardware
- * decoder (libamcodec). The hardware decodes them and shows them on the video
- * layer under the graphics plane, presenting each frame when its own clock
- * (pcrscr) reaches the frame's timestamp. This sink keeps that clock on the
- * pipeline clock and places the video where the "rectangle" property says.
+ * decoder (libamcodec). The decoder puts each decoded frame out on amlvideo
+ * (V4L2); a presenter thread hands back the frame due on each vsync and the video
+ * layer under the graphics plane shows it at the next one, as pannal's Kodi does.
+ * The hardware clock stays off. This sink also places the video where the
+ * "rectangle" property says.
  */
 
 #include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+
+#include <linux/videodev2.h>
 
 #include <gst/base/gstbasesink.h>
 #include <gst/gst.h>
 #include <gst/video/video.h>
 
 #include <codec.h>
+
+#include "aml_presenter.h"
 
 GST_DEBUG_CATEGORY_STATIC(aml_video_sink_debug);
 #define GST_CAT_DEFAULT aml_video_sink_debug
@@ -32,13 +41,8 @@ static struct {
   int (*close)(codec_para_t *);
   int (*reset)(codec_para_t *);
   int (*write)(codec_para_t *, void *, int);
-  int (*checkin_pts)(codec_para_t *, unsigned long);
-  int (*get_vpts)(codec_para_t *);
-  int (*get_pcrscr)(codec_para_t *);
-  int (*set_pcrscr)(codec_para_t *, int);
+  int (*checkin_pts_us64)(codec_para_t *, guint64);
   int (*pause)(codec_para_t *);
-  int (*resume)(codec_para_t *);
-  int (*set_freerun_mode)(codec_para_t *, unsigned int);
   int (*set_eos)(codec_para_t *, int);
 } amcodec;
 
@@ -56,8 +60,7 @@ static gboolean load_amcodec(void)
     dlclose(lib);                                                      \
     return FALSE;                                                      \
   }
-  LOAD(init) LOAD(close) LOAD(reset) LOAD(write) LOAD(checkin_pts) LOAD(get_vpts)
-  LOAD(get_pcrscr) LOAD(set_pcrscr) LOAD(pause) LOAD(resume) LOAD(set_freerun_mode) LOAD(set_eos)
+  LOAD(init) LOAD(close) LOAD(reset) LOAD(write) LOAD(checkin_pts_us64) LOAD(pause) LOAD(set_eos)
 #undef LOAD
   return TRUE;
 }
@@ -67,8 +70,6 @@ static gboolean load_amcodec(void)
 
 /* Frames go to the decoder this far ahead of their display time. */
 #define LEAD_TIME (500 * GST_MSECOND)
-/* Correct the hardware clock when it is further than this from the pipeline clock (90 kHz ticks). */
-#define MAX_CLOCK_DRIFT (90000 / 50)
 /* Longest wait at end of stream for the last frame to be shown. */
 #define EOS_TIMEOUT (2 * G_USEC_PER_SEC)
 
@@ -86,7 +87,9 @@ static gboolean load_amcodec(void)
 #define SYSFS_BLACKOUT_POLICY SYSFS_ROOT "/sys/class/video/blackout_policy"
 #define SYSFS_VID_MUTE SYSFS_ROOT "/sys/class/amhdmitx/amhdmitx0/vid_mute"
 #define SYSFS_TSYNC_ENABLE SYSFS_ROOT "/sys/class/tsync/enable"
-#define SYSFS_TSYNC_MODE SYSFS_ROOT "/sys/class/tsync/mode"
+#define SYSFS_FREERUN_MODE SYSFS_ROOT "/sys/class/video/freerun_mode"
+/* The V4L2 device the decoder puts its frames out on (FRAME_BASE_PATH_AMLVIDEO_AMVIDEO). */
+#define AMLVIDEO_DEVICE SYSFS_ROOT "/dev/video10"
 #define SYSFS_FB_PAGE SYSFS_ROOT "/sys/class/graphics/fb0/free_scale_axis"
 #define SYSFS_FB_SCREEN SYSFS_ROOT "/sys/class/graphics/fb0/window_axis"
 #define SYSFS_VCODEC_PROFILE SYSFS_ROOT "/sys/class/amstream/vcodec_profile"
@@ -100,7 +103,10 @@ struct _GstAmlVideoSink {
   codec_para_t codec;
   gboolean open;
   gint flushing;   /* atomic: set while the streaming thread must stop waiting */
-  guint32 last_pts; /* 90 kHz timestamp of the last frame handed to the decoder */
+  guint64 last_pts_us; /* timestamp of the last frame handed to the decoder, as checked in */
+  int video_fd;     /* amlvideo, while open */
+  AmlPresenter *presenter; /* while open */
+  GstBuffer *prerolled; /* sent to the decoder at preroll; render skips it */
   gchar *config;    /* decoder config string; codec.config points here while open */
   gint saved_blackout; /* blackout_policy before the decoder opened; -1 when not changed */
   GstPadChainFunction base_chain; /* GstBaseSink's, for frames inside the segment */
@@ -108,8 +114,6 @@ struct _GstAmlVideoSink {
   /* Screen mute while a decoder (re)starts; guarded by hold_lock. */
   GMutex hold_lock;
   gboolean held;
-  guint32 hold_vpts;  /* decoder clock when the hold started */
-  guint32 hold_pts;   /* first frame queued after the hold started; 0 until then */
   GstClockID hold_timeout;
 
   /* Where the page wants the video, in page pixels; guarded by the object lock. */
@@ -289,7 +293,7 @@ static gboolean on_hold_timeout(GstClock *clock, GstClockTime time, GstClockID i
 
 /* Kodi's fix for the green flash at a decoder (re)start (CAMLCodec::HoldVideo): the
  * new decoder briefly writes over the frame still on screen, so mute the HDMI
- * output until a new frame shows, or VIDEO_HOLD_TIMEOUT at most. Only for a
+ * output until the presenter shows a new frame, or VIDEO_HOLD_TIMEOUT at most. Only for a
  * fullscreen video: the mute blanks the whole screen, page included. */
 static void hold_video(GstAmlVideoSink *self)
 {
@@ -306,8 +310,6 @@ static void hold_video(GstAmlVideoSink *self)
   g_mutex_lock(&self->hold_lock);
   write_sysfs(SYSFS_VID_MUTE, "1");
   self->held = TRUE;
-  self->hold_vpts = self->open ? (guint32)amcodec.get_vpts(&self->codec) : 0;
-  self->hold_pts = 0;
   self->hold_timeout = timeout;
   g_mutex_unlock(&self->hold_lock);
   if (gst_clock_id_wait_async(timeout, on_hold_timeout, gst_object_ref(self), gst_object_unref) != GST_CLOCK_OK)
@@ -315,56 +317,80 @@ static void hold_video(GstAmlVideoSink *self)
   GST_DEBUG_OBJECT(self, "screen muted until the first new frame");
 }
 
-/* Called for each frame queued: unmute once the decoder shows the first frame
- * queued since the hold began. The decoder clock must also have moved, as the
- * previous video may have left it past the new timestamps. */
-static void check_hold(GstAmlVideoSink *self, guint32 queued_pts)
+/* The presenter shows the first frame since the decoder (re)started. */
+static void on_first_frame(gpointer data)
 {
-  gboolean shown;
-  guint32 vpts;
+  release_hold(data, NULL);
+}
 
-  g_mutex_lock(&self->hold_lock);
-  if (!self->held) {
-    g_mutex_unlock(&self->hold_lock);
-    return;
+/* The presenter's device operations: vsyncs from the decoder's control device (as
+ * Kodi's CAMLCodec::PollFrame), frames from amlvideo, time from the pipeline clock. */
+static int amlvideo_poll_vsync(void *ctx, int timeout_ms)
+{
+  GstAmlVideoSink *self = ctx;
+  struct pollfd fd = {.fd = self->codec.cntl_handle, .events = POLLOUT};
+  int ret = poll(&fd, 1, timeout_ms);
+
+  if (ret < 0)
+    return -errno;
+  if (ret == 0)
+    return 0;
+  return (fd.revents & POLLOUT) && !(fd.revents & (POLLERR | POLLHUP | POLLNVAL)) ? 1 : -EIO;
+}
+
+static int amlvideo_dequeue(void *ctx, guint *index, guint64 *pts_us)
+{
+  GstAmlVideoSink *self = ctx;
+  struct v4l2_buffer buf = {.type = V4L2_BUF_TYPE_VIDEO_CAPTURE};
+
+  if (ioctl(self->video_fd, VIDIOC_DQBUF, &buf) < 0) {
+    int err = errno;
+
+    if (err != EAGAIN)
+      GST_WARNING_OBJECT(self, "VIDIOC_DQBUF failed: %s", g_strerror(err));
+    return -err;
   }
-  if (!self->hold_pts)
-    self->hold_pts = queued_pts;
-  vpts = (guint32)amcodec.get_vpts(&self->codec);
-  shown = self->hold_pts && vpts != self->hold_vpts && (gint32)(vpts - self->hold_pts) >= 0;
-  g_mutex_unlock(&self->hold_lock);
-  if (shown)
-    release_hold(self, NULL);
+  *index = buf.index;
+  /* amlvideo splits the 64-bit timestamp over the two fields. */
+  *pts_us = (guint64)(guint32)buf.timestamp.tv_sec << 32 | (guint32)buf.timestamp.tv_usec;
+  return 0;
 }
 
-/* Running time to the decoder's 90 kHz clock; +1 keeps 0, which amcodec treats as "no time", unused. */
-static guint32 to_pts(GstClockTime running_time)
+static int amlvideo_queue(void *ctx, guint index, gboolean drop)
 {
-  return (guint32)(gst_util_uint64_scale(running_time, 90000, GST_SECOND) + 1);
+  GstAmlVideoSink *self = ctx;
+  struct v4l2_buffer buf = {.type = V4L2_BUF_TYPE_VIDEO_CAPTURE, .index = index};
+
+  /* With the DONE flag amlvideo takes the buffer back without showing it. */
+  if (drop)
+    buf.flags = V4L2_BUF_FLAG_DONE;
+  return ioctl(self->video_fd, VIDIOC_QBUF, &buf) < 0 ? -errno : 0;
 }
 
-static void sync_hardware_clock(GstAmlVideoSink *self, gboolean force)
+static gint64 pipeline_running_us(void *ctx)
 {
-  GstElement *element = GST_ELEMENT(self);
+  GstElement *element = ctx;
   GstClock *clock = gst_element_get_clock(element);
   GstClockTime now, base_time;
-  guint32 target, current;
 
   if (!clock)
-    return;
+    return -1;
   now = gst_clock_get_time(clock);
   gst_object_unref(clock);
   base_time = gst_element_get_base_time(element);
-  if (now < base_time)
-    return;
-
-  target = to_pts(now - base_time);
-  current = (guint32)amcodec.get_pcrscr(&self->codec);
-  if (force || ABS((gint32)(target - current)) > MAX_CLOCK_DRIFT) {
-    GST_LOG_OBJECT(self, "hardware clock %u -> %u", current, target);
-    amcodec.set_pcrscr(&self->codec, (int)target);
-  }
+  return now >= base_time ? (gint64)((now - base_time) / GST_USECOND) : -1;
 }
+
+static gint64 monotonic_us(void *ctx)
+{
+  (void)ctx;
+  return g_get_monotonic_time();
+}
+
+static const AmlPresenterOps amlvideo_ops = {amlvideo_poll_vsync, amlvideo_dequeue, amlvideo_queue,
+                                             pipeline_running_us, monotonic_us};
+/* The host test swaps in a fake amlvideo. */
+static const AmlPresenterOps *presenter_ops = &amlvideo_ops;
 
 static void restore_blackout(GstAmlVideoSink *self)
 {
@@ -380,11 +406,19 @@ static void restore_blackout(GstAmlVideoSink *self)
 static void close_decoder(GstAmlVideoSink *self)
 {
   g_clear_pointer(&self->config, g_free);
+  gst_buffer_replace(&self->prerolled, NULL);
   if (!self->open)
     return;
   release_hold(self, NULL);
+  /* First: the decoder must get every frame the presenter holds back before it closes. */
+  g_clear_pointer(&self->presenter, aml_presenter_free);
   amcodec.close(&self->codec);
+  close(self->video_fd);
+  self->video_fd = -1;
   self->open = FALSE;
+  /* As Kodi closes: the hardware clock back on, so other players work. */
+  write_sysfs(SYSFS_TSYNC_ENABLE, "1");
+  write_sysfs(SYSFS_FREERUN_MODE, "0");
   write_sysfs(SYSFS_DISABLE_VIDEO, "1");
   /* After the close: blackout_policy 1 made the kernel drop the last frame there. */
   restore_blackout(self);
@@ -441,9 +475,8 @@ static gboolean open_decoder(GstAmlVideoSink *self, GstCaps *caps)
   self->codec.noblock = 1;
   self->codec.stream_type = STREAM_TYPE_ES_VIDEO;
   self->codec.dec_mode = STREAM_TYPE_FRAME;
-  /* Straight to the video layer ("vdec amvideo"). The amlvideo path waits for an app to
-   * dequeue frames over V4L2, as Kodi does, and the kernel has no map for FRAME_BASE_PATH_AMVIDEO. */
-  self->codec.video_path = FRAME_BASE_PATH_TUNNEL_MODE;
+  /* Decoded frames go out on amlvideo, where the presenter takes them ("vdec amlvideo ... amvideo"). */
+  self->codec.video_path = FRAME_BASE_PATH_AMLVIDEO_AMVIDEO;
   self->codec.am_sysinfo.param = (void *)EXTERNAL_PTS;
 
   if (gst_structure_has_name(s, "video/x-h264")) {
@@ -473,9 +506,12 @@ static gboolean open_decoder(GstAmlVideoSink *self, GstCaps *caps)
   /* Frame duration in 1/96000 s; 0 lets the decoder work it out. */
   self->codec.am_sysinfo.rate = fps_n > 0 ? (unsigned int)gst_util_uint64_scale_int(96000, fps_d, fps_n) : 0;
 
-  /* The hardware presents frames by its own clock, which sync_hardware_clock() steers. */
-  write_sysfs(SYSFS_TSYNC_ENABLE, "1");
-  write_sysfs(SYSFS_TSYNC_MODE, "0");
+  self->video_fd = open(AMLVIDEO_DEVICE, O_RDONLY | O_NONBLOCK);
+  if (self->video_fd < 0) {
+    GST_ELEMENT_ERROR(self, RESOURCE, NOT_FOUND, ("No amlvideo device."),
+        ("cannot open %s: %s", AMLVIDEO_DEVICE, g_strerror(errno)));
+    return FALSE;
+  }
   /* As Kodi plays: with blackout_policy 0 the kernel keeps the last frame on the
    * video layer when the decoder closes, and turns that layer back on even after
    * disable_video=1; an HDR frame left there keeps the TV in HDR under Kodi. */
@@ -485,20 +521,29 @@ static gboolean open_decoder(GstAmlVideoSink *self, GstCaps *caps)
 
   ret = amcodec.init(&self->codec);
   if (ret != 0) {
+    close(self->video_fd);
+    self->video_fd = -1;
     restore_blackout(self);
     GST_ELEMENT_ERROR(self, RESOURCE, OPEN_WRITE, ("Cannot open the hardware video decoder."),
         ("codec_init failed: %d", ret));
     return FALSE;
   }
   self->open = TRUE;
-  amcodec.set_freerun_mode(&self->codec, 0);
+  /* As Kodi opens it (and never resumes): the presenter decides what shows. */
+  amcodec.pause(&self->codec);
+  /* The hardware clock off, and the video layer shows each frame as it is queued. */
+  write_sysfs(SYSFS_TSYNC_ENABLE, "0");
+  write_sysfs(SYSFS_FREERUN_MODE, "1");
   /* 2 = VIDEO_DISABLE_FORNEXT: the video plane comes on with the first decoded
    * frame; on now it would show leftover memory (green/pink) until then. */
   write_sysfs(SYSFS_DISABLE_VIDEO, "2");
   apply_rectangle(self);
   hold_video(self);
-  if (GST_STATE(self) != GST_STATE_PLAYING)
-    amcodec.pause(&self->codec);
+  self->presenter = aml_presenter_new(presenter_ops, self);
+  aml_presenter_set_shown_callback(self->presenter, on_first_frame, self);
+  aml_presenter_set_segment(self->presenter, &GST_BASE_SINK(self)->segment);
+  aml_presenter_set_playing(self->presenter, GST_STATE(self) == GST_STATE_PLAYING);
+  aml_presenter_start(self->presenter);
   GST_INFO_OBJECT(self, "decoder open: %" GST_PTR_FORMAT, caps);
   return TRUE;
 }
@@ -638,17 +683,19 @@ static GstFlowReturn write_av1(GstAmlVideoSink *self, const guint8 *data, gsize 
   return ret;
 }
 
-/* Queues the frame's timestamp (when valid) and hands the frame to the decoder. */
-static GstFlowReturn write_frame(GstAmlVideoSink *self, GstBuffer *buffer, GstClockTime running_time)
+/* Queues the frame's timestamp (when valid) and hands the frame to the decoder. The
+ * timestamp is the frame's own time in us, +1 as amcodec reads 0 as "none"; the
+ * presenter maps it to running time with the segment. */
+static GstFlowReturn write_frame(GstAmlVideoSink *self, GstBuffer *buffer)
 {
+  GstClockTime pts = GST_BUFFER_PTS(buffer);
   GstFlowReturn ret;
   GstMapInfo map;
 
-  if (GST_CLOCK_TIME_IS_VALID(running_time)) {
-    self->last_pts = to_pts(running_time);
-    if (amcodec.checkin_pts(&self->codec, self->last_pts) != 0)
-      GST_WARNING_OBJECT(self, "cannot queue timestamp %u", self->last_pts);
-    check_hold(self, self->last_pts);
+  if (GST_CLOCK_TIME_IS_VALID(pts)) {
+    self->last_pts_us = pts / GST_USECOND + 1;
+    if (amcodec.checkin_pts_us64(&self->codec, self->last_pts_us) != 0)
+      GST_WARNING_OBJECT(self, "cannot queue timestamp %" G_GUINT64_FORMAT, self->last_pts_us);
   }
 
   if (!gst_buffer_map(buffer, &map, GST_MAP_READ))
@@ -669,13 +716,30 @@ static GstFlowReturn gst_aml_video_sink_render(GstBaseSink *bsink, GstBuffer *bu
 
   if (!self->open)
     return GST_FLOW_NOT_NEGOTIATED;
-  sync_hardware_clock(self, FALSE);
-  return write_frame(self, buffer,
-      gst_segment_to_running_time(&bsink->segment, GST_FORMAT_TIME, GST_BUFFER_PTS(buffer)));
+  if (buffer == self->prerolled) { /* the decoder has it since the preroll */
+    gst_buffer_replace(&self->prerolled, NULL);
+    return GST_FLOW_OK;
+  }
+  return write_frame(self, buffer);
+}
+
+/* Paused, the frame GstBaseSink prerolls on goes to the decoder now, so the presenter
+ * can show it as the preroll picture (a seek while paused shows its target). */
+static GstFlowReturn gst_aml_video_sink_preroll(GstBaseSink *bsink, GstBuffer *buffer)
+{
+  GstAmlVideoSink *self = GST_AML_VIDEO_SINK(bsink);
+  GstFlowReturn ret;
+
+  if (!self->open)
+    return GST_FLOW_NOT_NEGOTIATED;
+  ret = write_frame(self, buffer);
+  if (ret == GST_FLOW_OK)
+    gst_buffer_replace(&self->prerolled, buffer);
+  return ret;
 }
 
 /* Frames before the segment start lead from a keyframe up to a seek target. The
- * decoder needs them, and timed at the start the hardware skips straight past them.
+ * decoder needs them, and the presenter drops them as before the segment.
  * They go to the decoder here, before GstBaseSink, which would drop them or, kept,
  * preroll on the first one; Cobalt's player only finishes a seek once frames past
  * the target have left its queue, which a keyframe seconds earlier can fill. */
@@ -688,7 +752,7 @@ static GstFlowReturn gst_aml_video_sink_chain(GstPad *pad, GstObject *parent, Gs
 
   if (!self->open || segment->format != GST_FORMAT_TIME || !GST_CLOCK_TIME_IS_VALID(pts) || pts >= segment->start)
     return self->base_chain(pad, parent, buffer);
-  ret = write_frame(self, buffer, gst_segment_to_running_time(segment, GST_FORMAT_TIME, segment->start));
+  ret = write_frame(self, buffer);
   gst_buffer_unref(buffer);
   return ret;
 }
@@ -697,31 +761,39 @@ static GstFlowReturn gst_aml_video_sink_chain(GstPad *pad, GstObject *parent, Gs
 static void wait_for_last_frame(GstAmlVideoSink *self)
 {
   gint64 deadline = g_get_monotonic_time() + EOS_TIMEOUT;
+  guint64 done = 0;
 
+  if (!self->open)
+    return;
   /* The decoder holds its last frames for reordering until it knows the stream ended. */
-  if (self->open)
-    amcodec.set_eos(&self->codec, 1);
-  while (self->open && !g_atomic_int_get(&self->flushing) && g_get_monotonic_time() < deadline &&
-         (gint32)((guint32)amcodec.get_vpts(&self->codec) - self->last_pts) < 0)
-    g_usleep(10000);
-  GST_DEBUG_OBJECT(self, "end of stream: shown %u, last %u", self->open ? (guint32)amcodec.get_vpts(&self->codec) : 0,
-      self->last_pts);
+  amcodec.set_eos(&self->codec, 1);
+  /* In slices, so a flush does not wait for the timeout. */
+  while (!g_atomic_int_get(&self->flushing) && g_get_monotonic_time() < deadline &&
+         (done = aml_presenter_wait_shown(self->presenter, self->last_pts_us, 20000)) < self->last_pts_us)
+    ;
+  GST_DEBUG_OBJECT(self, "end of stream: shown up to %" G_GUINT64_FORMAT ", last %" G_GUINT64_FORMAT, done,
+      self->last_pts_us);
 }
 
 static gboolean gst_aml_video_sink_event(GstBaseSink *bsink, GstEvent *event)
 {
   GstAmlVideoSink *self = GST_AML_VIDEO_SINK(bsink);
+  GstEventType type = GST_EVENT_TYPE(event);
+  gboolean ret;
 
-  switch (GST_EVENT_TYPE(event)) {
+  switch (type) {
     case GST_EVENT_FLUSH_STOP:
-      /* Drop what the decoder still holds; the next frames start a new timeline. */
+      /* Drop what the decoder still holds; the next frames start a new timeline. The
+       * presenter hands its frames back first, or the reset stalls on them. */
       if (self->open) {
         hold_video(self);
+        aml_presenter_flush(self->presenter);
+        amcodec.pause(&self->codec); /* as Kodi resets */
         amcodec.reset(&self->codec);
-        if (GST_STATE(self) != GST_STATE_PLAYING)
-          amcodec.pause(&self->codec);
+        aml_presenter_start(self->presenter);
       }
-      self->last_pts = 0;
+      self->last_pts_us = 0;
+      gst_buffer_replace(&self->prerolled, NULL);
       break;
     case GST_EVENT_EOS:
       wait_for_last_frame(self);
@@ -729,7 +801,11 @@ static gboolean gst_aml_video_sink_event(GstBaseSink *bsink, GstEvent *event)
     default:
       break;
   }
-  return GST_BASE_SINK_CLASS(gst_aml_video_sink_parent_class)->event(bsink, event);
+  ret = GST_BASE_SINK_CLASS(gst_aml_video_sink_parent_class)->event(bsink, event);
+  /* GstBaseSink stores the new segment; the presenter times frames with it. */
+  if (type == GST_EVENT_SEGMENT && self->presenter)
+    aml_presenter_set_segment(self->presenter, &bsink->segment);
+  return ret;
 }
 
 static gboolean gst_aml_video_sink_unlock(GstBaseSink *bsink)
@@ -749,16 +825,15 @@ static GstStateChangeReturn gst_aml_video_sink_change_state(GstElement *element,
   GstAmlVideoSink *self = GST_AML_VIDEO_SINK(element);
   GstStateChangeReturn ret;
 
-  if (transition == GST_STATE_CHANGE_PLAYING_TO_PAUSED && self->open)
-    amcodec.pause(&self->codec);
+  if (transition == GST_STATE_CHANGE_PLAYING_TO_PAUSED && self->presenter)
+    aml_presenter_set_playing(self->presenter, FALSE);
 
   ret = GST_ELEMENT_CLASS(gst_aml_video_sink_parent_class)->change_state(element, transition);
   if (ret == GST_STATE_CHANGE_FAILURE)
     return ret;
 
-  if (transition == GST_STATE_CHANGE_PAUSED_TO_PLAYING && self->open) {
-    sync_hardware_clock(self, TRUE);
-    amcodec.resume(&self->codec);
+  if (transition == GST_STATE_CHANGE_PAUSED_TO_PLAYING && self->presenter) {
+    aml_presenter_set_playing(self->presenter, TRUE);
   } else if (transition == GST_STATE_CHANGE_PAUSED_TO_READY) {
     close_decoder(self);
   }
@@ -843,6 +918,7 @@ static void gst_aml_video_sink_class_init(GstAmlVideoSinkClass *klass)
 
   basesink_class->set_caps = gst_aml_video_sink_set_caps;
   basesink_class->render = gst_aml_video_sink_render;
+  basesink_class->preroll = gst_aml_video_sink_preroll;
   basesink_class->event = gst_aml_video_sink_event;
   basesink_class->unlock = gst_aml_video_sink_unlock;
   basesink_class->unlock_stop = gst_aml_video_sink_unlock_stop;
@@ -853,6 +929,7 @@ static void gst_aml_video_sink_init(GstAmlVideoSink *self)
   GstBaseSink *bsink = GST_BASE_SINK(self);
 
   self->saved_blackout = -1;
+  self->video_fd = -1;
   g_mutex_init(&self->hold_lock);
 
   /* Hand each frame over ahead of its time, never drop it: the decoder needs every frame. */
