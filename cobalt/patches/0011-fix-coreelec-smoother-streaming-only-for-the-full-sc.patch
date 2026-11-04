@@ -1,0 +1,65 @@
+From 7efcc90fcebc9d53aa3eb19fdcc0aa999130d534 Mon Sep 17 00:00:00 2001
+From: samtheruby <peasea1012@gmail.com>
+Date: Wed, 4 Nov 2026 04:49:56 +0000
+Subject: [PATCH 11/12] fix(coreelec): smoother streaming only for the
+ full-screen player
+
+The download keep-alive and the resume-after-stall gate also acted on home
+screen previews: a preview's stall paused it until 5 s were buffered, so
+previews often never started. Both now act only on the watch page, and a
+held video the page has since removed is never resumed.
+---
+ .../cobalt_java_script_polyfill/coretube_sabr.js       | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/cobalt/shell/embedded_resources/cobalt_java_script_polyfill/coretube_sabr.js b/cobalt/shell/embedded_resources/cobalt_java_script_polyfill/coretube_sabr.js
+index 171cd0bbafd..6c691c4a244 100644
+--- a/cobalt/shell/embedded_resources/cobalt_java_script_polyfill/coretube_sabr.js
++++ b/cobalt/shell/embedded_resources/cobalt_java_script_polyfill/coretube_sabr.js
+@@ -4,6 +4,7 @@
+  * SPDX-License-Identifier: BSD-3-Clause
+  */
+ // CoreTube: smoother YouTube (SABR) streaming, as SmartTube's player does it.
++// On the watch page:
+ // - A videoplayback download that YouTube aborts while data still arrives is
+ //   left to finish: after a far seek the server can be slow, and the player
+ //   kept aborting each slow download and throwing its data away.
+@@ -24,6 +25,7 @@
+ 
+   var now = function () { return performance.now(); };
+   var log = function (msg) { console.info('[CoreTube] ' + msg); };
++  var onWatchPage = function () { return location.hash.indexOf('#/watch') === 0; };
+   var lastSeek = -1e9;
+   document.addEventListener('seeking', function () { lastSeek = now(); }, true);
+ 
+@@ -56,7 +58,7 @@
+   var origAbort = AbortController.prototype.abort;
+   AbortController.prototype.abort = function () {
+     var d = downloads.get(this.signal);
+-    if (d && !d.done) {
++    if (d && !d.done && onWatchPage()) {
+       var t = now();
+       if (t - d.last < ALIVE_MS && t - lastSeek >= SEEK_GRACE_MS && t - d.start <= MAX_AGE_MS) {
+         log('kept a download still receiving data (' + Math.round((t - d.start) / 1000) + ' s old)');
+@@ -109,13 +111,17 @@
+   };
+   document.addEventListener('waiting', function (e) {
+     var v = e.target;
+-    if (gate || !(v instanceof HTMLVideoElement) || v.paused || v.ended) return;
++    if (gate || !onWatchPage() || !(v instanceof HTMLVideoElement) || v.paused || v.ended) return;
+     var need = now() - lastSeek < SEEK_WINDOW_MS ? RESUME_AFTER_SEEK_S : RESUME_S;
+     gate = { video: v, need: need, since: now() };
+     hide.pause++;
+     origPause.call(v);
+     log('stalled: holding playback until ' + need + ' s are buffered');
+     gate.timer = setInterval(function () {
++      if (!v.isConnected) {  // the page removed it (a new player took over)
++        endGate(false);
++        return;
++      }
+       var near = isFinite(v.duration) && v.currentTime + bufferedAhead(v) >= v.duration - 0.5;
+       if (bufferedAhead(v) >= gate.need || near || now() - gate.since > GATE_MAX_MS) endGate(true);
+     }, 250);
+-- 
+2.47.3
+

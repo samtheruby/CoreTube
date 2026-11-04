@@ -27,7 +27,7 @@ function page() {
   };
 
   class HTMLMediaElement {
-    constructor(id) { this.id = id; this.paused = false; this.ended = false; this.currentTime = 0; this.duration = 600; this.ranges = []; }
+    constructor(id) { this.id = id; this.paused = false; this.ended = false; this.currentTime = 0; this.duration = 600; this.ranges = []; this.isConnected = true; }
     get buffered() { const r = this.ranges; return { length: r.length, start: (i) => r[i][0], end: (i) => r[i][1] }; }
   }
   HTMLMediaElement.prototype.pause = function () { this.paused = true; p.dispatch('pause', this); };
@@ -54,7 +54,7 @@ function page() {
   const ctx = {
     console: { info: (m) => p.logs.push(m) },
     performance: { now: () => p.t },
-    location: { hostname: 'www.youtube.com' },
+    location: { hostname: 'www.youtube.com', hash: '#/watch?v=abc' },
     setInterval: (fn) => { p.timers.push(fn); return p.timers.length; },
     clearInterval: (id) => { p.timers[id - 1] = null; },
     document: { addEventListener: on('document') },
@@ -162,6 +162,37 @@ async function userWins() {
   assert.strictEqual(w.paused, false, 'resumes after 60 s at most');
 }
 
+// The keep-alive and the stall gate act only on the watch page, never on a preview,
+// and never resume a video the page removed.
+async function watchPageOnly() {
+  const p = page();
+  p.ctx.location.hash = '#/';
+  const c = new p.ctx.AbortController();
+  p.ctx.fetch('https://rr1.googlevideo.com/videoplayback?x', { signal: c.signal });
+  await settle();
+  p.t = 1000; p.downloads[0].push(10); await settle();
+  c.abort();
+  assert.strictEqual(c.signal.aborted, true, 'a preview download is aborted when the page asks');
+  const v = new p.ctx.HTMLVideoElement('v');
+  v.currentTime = 1; v.ranges = [[0, 1.1]];
+  p.dispatch('waiting', v);
+  assert.strictEqual(v.paused, false, 'a preview is never held');
+
+  const q = page();
+  const w = new q.ctx.HTMLVideoElement('w');
+  w.currentTime = 10; w.ranges = [[0, 10.1]];
+  q.dispatch('waiting', w);
+  assert.strictEqual(w.paused, true);
+  w.isConnected = false;  // the page removed it
+  w.ranges = [[0, 30]];
+  await q.wait(500);
+  assert.strictEqual(w.paused, true, 'a removed video is not resumed');
+  const x = new q.ctx.HTMLVideoElement('x');
+  x.currentTime = 5; x.ranges = [[0, 5.1]];
+  q.dispatch('waiting', x);
+  assert.strictEqual(x.paused, true, 'the next video can be held again');
+}
+
 async function onlyOnYouTube() {
   const ctx = { location: { hostname: 'h5vcc-embedded.example' }, console: { info() {} } };
   ctx.window = ctx;
@@ -170,7 +201,7 @@ async function onlyOnYouTube() {
 }
 
 (async () => {
-  for (const t of [keepAlive, abortsThatGoThrough, stallGate, userWins, onlyOnYouTube]) {
+  for (const t of [keepAlive, abortsThatGoThrough, stallGate, userWins, watchPageOnly, onlyOnYouTube]) {
     await t();
     console.log(t.name + ': ok');
   }
