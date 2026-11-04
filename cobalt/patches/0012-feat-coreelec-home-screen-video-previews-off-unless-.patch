@@ -1,0 +1,109 @@
+From e2ffd31e70689e0adea003a85382fe22e23bdae1 Mon Sep 17 00:00:00 2001
+From: samtheruby <peasea1012@gmail.com>
+Date: Wed, 4 Nov 2026 04:50:12 +0000
+Subject: [PATCH 12/12] feat(coreelec): home screen video previews off unless
+ turned on
+
+A preview starting can make the whole screen flash white for a moment, and
+the cause is not known yet. Previews are now off unless the add-on turns
+them on: TIZENTUBE_VIDEO_PREVIEWS=1 reaches the page as
+__coretubeVideoPreviews, and the page script sets TizenTube's "Video
+previews" option and YouTube's preview flag (ENABLE_PREVIEWS_WITH_SOUND,
+which starts and stops previews) to match at each start.
+---
+ cobalt/shell/browser/shell.cc                 | 12 ++++++++-
+ .../coretube_sabr.js                          | 27 +++++++++++++++++++
+ 2 files changed, 38 insertions(+), 1 deletion(-)
+
+diff --git a/cobalt/shell/browser/shell.cc b/cobalt/shell/browser/shell.cc
+index 050cea5b2b8..dec869250dd 100644
+--- a/cobalt/shell/browser/shell.cc
++++ b/cobalt/shell/browser/shell.cc
+@@ -25,6 +25,7 @@
+ #include <vector>
+ 
+ #include "base/command_line.h"
++#include "base/environment.h"
+ #include "base/feature_list.h"
+ #include "base/functional/callback_helpers.h"
+ #include "base/location.h"
+@@ -631,6 +632,16 @@ void Shell::DidStopLoading() {
+ }
+ 
+ void Shell::RegisterInjectedJavaScript() {
++  const std::vector<std::string> allowed_origins({"*"});
++  // CoreTube's add-on setting for home screen video previews, for
++  // coretube_sabr.js: TIZENTUBE_VIDEO_PREVIEWS=1 turns them on.
++  const bool previews = base::Environment::Create()->GetVar(
++                            "TIZENTUBE_VIDEO_PREVIEWS") == "1";
++  js_communication_host_->AddDocumentStartJavaScript(
++      previews ? u"window.__coretubeVideoPreviews = true;"
++               : u"window.__coretubeVideoPreviews = false;",
++      allowed_origins);
++
+   // Get the embedded header resource
+   GeneratedResourceMap resource_map;
+   CobaltJavaScriptPolyfill::GenerateMap(resource_map);
+@@ -642,7 +653,6 @@ void Shell::RegisterInjectedJavaScript() {
+ 
+     // Inject a script at document start for all origins
+     const std::u16string script(base::UTF8ToUTF16(js));
+-    const std::vector<std::string> allowed_origins({"*"});
+     auto result = js_communication_host_->AddDocumentStartJavaScript(
+         script, allowed_origins);
+ 
+diff --git a/cobalt/shell/embedded_resources/cobalt_java_script_polyfill/coretube_sabr.js b/cobalt/shell/embedded_resources/cobalt_java_script_polyfill/coretube_sabr.js
+index 6c691c4a244..81ede91091f 100644
+--- a/cobalt/shell/embedded_resources/cobalt_java_script_polyfill/coretube_sabr.js
++++ b/cobalt/shell/embedded_resources/cobalt_java_script_polyfill/coretube_sabr.js
+@@ -10,6 +10,8 @@
+ //   kept aborting each slow download and throwing its data away.
+ // - After a stall, playback resumes only with 5 s buffered (2.5 s within 5 s of
+ //   a seek), instead of playing a second and stalling again.
++// Home screen video previews are off unless the add-on turns them on: a preview
++// starting can flash the screen white for a moment (cause unknown).
+ (function () {
+   'use strict';
+   if (window.__coretubeSabr || !/(^|\.)youtube\.com$/.test(location.hostname)) return;
+@@ -22,6 +24,7 @@
+   var RESUME_AFTER_SEEK_S = 2.5;
+   var SEEK_WINDOW_MS = 5000;  // a stall this soon after a seek uses RESUME_AFTER_SEEK_S
+   var GATE_MAX_MS = 60000;    // never hold playback longer than this
++  var FLAG_WAIT_MS = 60000;   // longest wait for YouTube's settings to appear
+ 
+   var now = function () { return performance.now(); };
+   var log = function (msg) { console.info('[CoreTube] ' + msg); };
+@@ -29,6 +32,30 @@
+   var lastSeek = -1e9;
+   document.addEventListener('seeking', function () { lastSeek = now(); }, true);
+ 
++  // --- Home screen previews: off unless the add-on turns them on -----------
++  // The add-on's setting arrives as __coretubeVideoPreviews (true: on). It sets
++  // TizenTube's "Video previews" option, which TizenTube applies to YouTube's
++  // preview flag, and that flag itself in case TizenTube does not load.
++  var previews = window.__coretubeVideoPreviews === true;
++  try {
++    var config = JSON.parse(localStorage['ytaf-configuration'] || '{}');
++    if (config.enablePreviews !== previews) {
++      config.enablePreviews = previews;
++      localStorage['ytaf-configuration'] = JSON.stringify(config);
++    }
++  } catch (e) {
++    log('cannot set the video previews option: ' + e);
++  }
++  var flagWaitStart = now();
++  var setPreviewFlag = function () {
++    var flags = window._yttv && Object.values(window._yttv).find(function (v) {
++      return v instanceof Map && v.has('ENABLE_PREVIEWS_WITH_SOUND');
++    });
++    if (flags) flags.set('ENABLE_PREVIEWS_WITH_SOUND', previews);
++    else if (now() - flagWaitStart < FLAG_WAIT_MS) setTimeout(setPreviewFlag, 250);
++  };
++  setPreviewFlag();
++
+   // --- Keep slow downloads alive -------------------------------------------
+   var downloads = new WeakMap();  // AbortSignal -> {start, last, done}
+   var origFetch = window.fetch;
+-- 
+2.47.3
+

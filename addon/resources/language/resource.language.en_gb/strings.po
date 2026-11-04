@@ -74,3 +74,11 @@ msgstr ""
 msgctxt "#30018"
 msgid "Display modes for auto frame rate"
 msgstr ""
+
+msgctxt "#30019"
+msgid "Video previews on the home screen"
+msgstr ""
+
+msgctxt "#30020"
+msgid "Play a muted preview of the selected video on the home screen. Warning: previews can make the whole screen flash white for a moment as they start (cause unknown). This also sets TizenTube's own Video previews option at each start."
+msgstr ""

@@ -125,6 +125,7 @@ export HOME="${ADDON_HOME}"
   echo "graphics: ${graphics}, audio pause: ${audio_pause}"
   echo "max video height: ${TIZENTUBE_MAX_VIDEO_HEIGHT:-display}, auto frame rate modes: ${TIZENTUBE_DISPLAY_MODES:-none}"
   echo "user agent: ${TIZENTUBE_USER_AGENT:-Cobalt default}"
+  echo "home screen video previews: $([ "${TIZENTUBE_VIDEO_PREVIEWS:-0}" = 1 ] && echo on || echo off)"
   echo "passthrough: ${TIZENTUBE_PASSTHROUGH:-off}${TIZENTUBE_PASSTHROUGH:+ to ${TIZENTUBE_PASSTHROUGH_DEVICE}}"
   # The user agent holds spaces and ';', so it goes over as one argument.
   export ADDON_DIR

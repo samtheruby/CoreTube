@@ -9,7 +9,7 @@ const vm = require('vm');
 const source = fs.readFileSync(process.argv[2], 'utf8');
 
 // A page: fake time, timers, events, media elements, fetch and AbortController.
-function page() {
+function page(extra = {}) {
   const p = { t: 0, logs: [], timers: [], seen: [] };
   const listeners = { window: {}, document: {} };
   const on = (where) => (type, fn) => { (listeners[where][type] = listeners[where][type] || []).push(fn); };
@@ -51,10 +51,17 @@ function page() {
     return Promise.resolve({ clone: () => ({ body }) });
   };
 
+  // One-shot timers run when the test calls p.runTimeouts().
+  p.timeouts = [];
+  p.runTimeouts = () => { const due = p.timeouts.splice(0); due.forEach((fn) => fn()); };
+
   const ctx = {
     console: { info: (m) => p.logs.push(m) },
     performance: { now: () => p.t },
     location: { hostname: 'www.youtube.com', hash: '#/watch?v=abc' },
+    localStorage: {},
+    Map,  // the test's own, so the script's instanceof Map holds for the test's maps
+    setTimeout: (fn) => { p.timeouts.push(fn); },
     setInterval: (fn) => { p.timers.push(fn); return p.timers.length; },
     clearInterval: (id) => { p.timers[id - 1] = null; },
     document: { addEventListener: on('document') },
@@ -62,6 +69,7 @@ function page() {
   };
   ctx.window = ctx;
   ctx.window.addEventListener = on('window');
+  Object.assign(ctx, extra);
   vm.runInNewContext(source, ctx);
   p.ctx = ctx;
   // Time passes in 250 ms steps; interval timers run each step.
@@ -162,6 +170,35 @@ async function userWins() {
   assert.strictEqual(w.paused, false, 'resumes after 60 s at most');
 }
 
+// Home screen previews are off unless the add-on turns them on
+// (__coretubeVideoPreviews): TizenTube's option and YouTube's flag follow it.
+async function videoPreviews() {
+  const flags = () => new Map([['ENABLE_PREVIEWS_WITH_SOUND', true]]);
+  const config = '{"enableAdBlock":true,"enablePreviews":true}';
+
+  const off = page({ localStorage: { 'ytaf-configuration': config } });
+  assert.deepStrictEqual(JSON.parse(off.ctx.localStorage['ytaf-configuration']),
+    { enableAdBlock: true, enablePreviews: false }, 'off by default; other options kept');
+  const yt = flags();
+  off.ctx._yttv = { a: {}, b: yt };  // YouTube's settings appear later
+  off.runTimeouts();
+  assert.strictEqual(yt.get('ENABLE_PREVIEWS_WITH_SOUND'), false, "YouTube's flag off");
+
+  const on = page({ __coretubeVideoPreviews: true, _yttv: { b: flags() } });
+  assert.strictEqual(JSON.parse(on.ctx.localStorage['ytaf-configuration']).enablePreviews, true,
+    'on when the add-on turns them on, with no stored options yet');
+  assert.strictEqual(on.ctx._yttv.b.get('ENABLE_PREVIEWS_WITH_SOUND'), true);
+
+  const broken = page({ localStorage: { 'ytaf-configuration': '{oops' } });
+  assert.strictEqual(broken.ctx.localStorage['ytaf-configuration'], '{oops', 'unreadable options left alone');
+  assert.ok(broken.logs.some((l) => l.includes('cannot set the video previews option')));
+
+  const never = page();  // YouTube's settings never appear: stop looking after a minute
+  never.t = 61000;
+  never.runTimeouts();
+  assert.strictEqual(never.timeouts.length, 0);
+}
+
 // The keep-alive and the stall gate act only on the watch page, never on a preview,
 // and never resume a video the page removed.
 async function watchPageOnly() {
@@ -201,7 +238,7 @@ async function onlyOnYouTube() {
 }
 
 (async () => {
-  for (const t of [keepAlive, abortsThatGoThrough, stallGate, userWins, watchPageOnly, onlyOnYouTube]) {
+  for (const t of [keepAlive, abortsThatGoThrough, stallGate, userWins, videoPreviews, watchPageOnly, onlyOnYouTube]) {
     await t();
     console.log(t.name + ': ok');
   }

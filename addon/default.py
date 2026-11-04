@@ -60,7 +60,9 @@ def choose_modes():
 def start():
   max_height = addon.getSetting('max_resolution')
   env = {'TIZENTUBE_DISPLAY_MODES': allowed_modes(),
-         'TIZENTUBE_MAX_VIDEO_HEIGHT': '' if max_height == 'auto' else max_height}
+         'TIZENTUBE_MAX_VIDEO_HEIGHT': '' if max_height == 'auto' else max_height,
+         # Off by default: previews can flash the screen white as they start.
+         'TIZENTUBE_VIDEO_PREVIEWS': '1' if addon.getSettingBool('video_previews') else '0'}
   # Cobalt needs the framebuffer, so Kodi stops while it runs. A separate systemd
   # unit keeps Cobalt alive when Kodi stops, and ExecStopPost brings Kodi back
   # however Cobalt ends (exit, crash or `systemctl stop tizentube`).
