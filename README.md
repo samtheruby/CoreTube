@@ -38,6 +38,8 @@ In Kodi, open **Add-ons**, choose **Install from zip file**, and pick the zip. T
 
 Auto frame rate changes the TV's display mode only for fullscreen videos. Preview cards do not trigger mode changes.
 
+TizenTube tells YouTube it is a Fire TV Cube, because YouTube buffers much better for it. To send Cobalt's own user agent instead, put `export TIZENTUBE_USER_AGENT=''` in the add-on's `env` file (in Kodi's `userdata/addon_data/browser.tizentube` folder).
+
 Video previews on the home screen are off. To turn them on, open the add-on's settings (**Add-ons** > TizenTube > **Configure**) and switch on **Video previews on the home screen**. Previews can make the screen flash white for a moment as they start; the cause is not known yet.
 
 ## Tests

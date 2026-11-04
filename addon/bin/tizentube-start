@@ -6,13 +6,14 @@
 # Runs inside the transient unit tizentube (see default.py). Same steps as the
 # WebKit add-on's webkit-start. Optional overrides go in $ADDON_HOME/env, e.g.
 # TIZENTUBE_ARGS (extra Cobalt switches) and TIZENTUBE_USER_AGENT (the user
-# agent sent to YouTube, which decides the streams it serves).
+# agent sent to YouTube, which decides the streams it serves; default.py sets a
+# Fire TV Cube one, and an empty value gives Cobalt's own).
 
 . /etc/profile
 oe_setup_addon browser.tizentube
 
 TIZENTUBE_ARGS=""
-TIZENTUBE_USER_AGENT=""
+TIZENTUBE_USER_AGENT="${TIZENTUBE_USER_AGENT-}"
 [ -e "${ADDON_HOME}/env" ] && . "${ADDON_HOME}/env"
 
 # zip packaging drops the executable bits

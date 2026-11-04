@@ -17,6 +17,11 @@ sys.path.insert(0, os.path.join(addon_dir, 'resources', 'lib'))
 import display_modes
 
 DISP_CAP = '/sys/class/amhdmitx/amhdmitx0/disp_cap'
+# Cobalt identifies as a Fire TV Cube (2019): YouTube buffers much better for it
+# than for Cobalt's own user agent. TIZENTUBE_USER_AGENT in the env file overrides it.
+FIRE_TV_USER_AGENT = ('Mozilla/5.0 (RDK; Linux 4.9.269) Cobalt/27.lts.10.1041863-qa (unlike Gecko) '
+                      'v8/13.8.258.54-jit gles Evergreen/1.0.0 Evergreen-Lite Evergreen-Uncompressed '
+                      'Starboard/18, Amazon_ATV_S922X_2019/AFTR (Amazon, AFTR, Wireless)')
 
 
 def read_disp_cap():
@@ -62,7 +67,8 @@ def start():
   env = {'TIZENTUBE_DISPLAY_MODES': allowed_modes(),
          'TIZENTUBE_MAX_VIDEO_HEIGHT': '' if max_height == 'auto' else max_height,
          # Off by default: previews can flash the screen white as they start.
-         'TIZENTUBE_VIDEO_PREVIEWS': '1' if addon.getSettingBool('video_previews') else '0'}
+         'TIZENTUBE_VIDEO_PREVIEWS': '1' if addon.getSettingBool('video_previews') else '0',
+         'TIZENTUBE_USER_AGENT': FIRE_TV_USER_AGENT}
   # Cobalt needs the framebuffer, so Kodi stops while it runs. A separate systemd
   # unit keeps Cobalt alive when Kodi stops, and ExecStopPost brings Kodi back
   # however Cobalt ends (exit, crash or `systemctl stop tizentube`).
