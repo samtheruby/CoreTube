@@ -42,6 +42,17 @@ for want in coretube-no build.CoreELEC-Amlogic-no.aarch64-22 evergreen-arm64-cor
 done
 [ ! -e "$tmp/work" ] || fail "--dry-run created the work folder"
 
+# Every build brings the engine up to date, so new Cobalt patches reach the zip.
+# ARM builds it in the CoreELEC folder: the old RDK engine needs the RDK SDK,
+# which the build image does not have.
+for a in arm aarch64; do
+  line=$(plan $a | grep '^step cobalt:')
+  echo "$line" | grep -qF "brought up to date" || fail "$a engine not brought up to date: $line"
+done
+line=$(plan arm | grep '^step cobalt:')
+echo "$line" | grep -qF "engine in out/evergreen-arm-hardfp-coreelec_qa," || fail "arm engine not in the CoreELEC folder: $line"
+case $line in *rdk*) fail "arm still uses the RDK engine: $line" ;; esac
+
 # With --docker each step runs as the owner of one folder and may write only there.
 # check_owner PLAN STEP DIR: STEP runs as DIR's owner and writes nothing outside DIR.
 check_owner() {

@@ -54,20 +54,20 @@ done
 
 # test mode may run without --arch.
 image="" ce_url="" ce_commit="" ce_device="" ce_subdir="" triple="" cc_flags=""
-platform="" stock="" sysroot_arch="" legacy=""
+platform="" stock="" sysroot_arch=""
 case $arch in
   arm)
     image=coretube-ng ce_url=$COREELEC_NG_URL ce_commit=$COREELEC_NG_COMMIT
     ce_device=Amlogic-ng ce_subdir=build.CoreELEC-Amlogic-ng.arm-21
     triple=armv8a-libreelec-linux-gnueabihf cc_flags=""
-    platform=evergreen-arm-hardfp-coreelec stock=evergreen-arm-hardfp sysroot_arch=arm
-    # Engine of the earlier RDK-SDK builds; same ARM hard-float ABI, reused if present.
-    legacy=evergreen-arm-hardfp-rdk ;;
+    # No stock: this Cobalt has no evergreen-arm-hardfp config, so the engine is
+    # built in the CoreELEC platform's own folder.
+    platform=evergreen-arm-hardfp-coreelec ;;
   aarch64)
     image=coretube-no ce_url=$COREELEC_NO_URL ce_commit=$COREELEC_NO_COMMIT
     ce_device=Amlogic-no ce_subdir=build.CoreELEC-Amlogic-no.aarch64-22
     triple=aarch64-libreelec-linux-gnu cc_flags="-fuse-ld=gold"
-    platform=evergreen-arm64-coreelec stock=evergreen-arm64 sysroot_arch=arm64 legacy="" ;;
+    platform=evergreen-arm64-coreelec stock=evergreen-arm64 sysroot_arch=arm64 ;;
   "") [ "$mode" = test ] || usage_error "--arch is required" ;;
   *) usage_error "unknown --arch: $arch (use arm or aarch64)" ;;
 esac
@@ -212,7 +212,7 @@ Use another --build-dir, or --allow-rebuild to replace them."
 
 find_engine() {
   local d
-  for d in "$out" "$src/out/${stock}_qa" ${legacy:+"$src/out/${legacy}_qa"}; do
+  for d in "$out" ${stock:+"$src/out/${stock}_qa"}; do
     [ -f "$d/app/cobalt/lib/libcobalt.so" ] && { echo "$d"; return; }
   done
 }
@@ -245,11 +245,17 @@ EOF
   (cd "$src" && python3 cobalt/build/gn.py -p "$platform" -C qa --no-rbe &&
     autoninja -C "out/${platform}_qa" -j "$jobs" libloader_app.so starboard/libocdm.so \
       starboard/content/fonts:copy_font_data)
-  if [ -z "$(find_engine)" ]; then
+  local engine
+  engine=$(find_engine)
+  if [ -z "$engine" ] && [ -n "$stock" ]; then
     (cd "$src" && python3 build/linux/sysroot_scripts/install-sysroot.py --arch="$sysroot_arch" &&
-      python3 cobalt/build/gn.py -p "$stock" -C qa --no-rbe &&
-      autoninja -C "out/${stock}_qa" -j "$jobs" cobalt)
+      python3 cobalt/build/gn.py -p "$stock" -C qa --no-rbe)
+    engine=$src/out/${stock}_qa
   fi
+  # Always build: the patches change the engine too, and only what changed is rebuilt.
+  # The copy targets refresh app/cobalt/, where the zip takes the engine from.
+  (cd "$src" && autoninja -C "${engine:-$out}" -j "$jobs" \
+    cobalt:copy_cobalt_uncompressed_lib cobalt:copy_cobalt_content)
 }
 
 step_helper() {
@@ -351,7 +357,7 @@ if [ "$dry_run" = 1 ]; then
   echo "arch $arch: CoreELEC $ce_device $ce_url @ ${ce_commit:0:12}, image $image"
   echo "step sources: helper tooling (as owner of $(owner_folder sources); writes $work_dir/tooling)"
   echo "step packages: CoreELEC checkout $ce, $packages, stamps checked, --allow-rebuild=$allow_rebuild (as owner of $(owner_folder packages); writes $ce_build)"
-  echo "step cobalt: $src at ${COBALT_COMMIT:0:12} + cobalt/patches, $platform qa, engine from $platform, $stock${legacy:+ or $legacy} (as owner of $(owner_folder cobalt); writes $cobalt_dir)"
+  echo "step cobalt: $src at ${COBALT_COMMIT:0:12} + cobalt/patches, $platform qa, engine in out/${platform}_qa${stock:+ or out/${stock}_qa}, brought up to date (as owner of $(owner_folder cobalt); writes $cobalt_dir)"
   echo "step helper: android-drm-helper (as owner of $(owner_folder helper); writes $work_dir/$arch)"
   echo "step zip: $zip_file (as owner of $(owner_folder zip); writes $repo/out)"
   echo "jobs: $jobs"
