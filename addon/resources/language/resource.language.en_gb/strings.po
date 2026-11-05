@@ -16,11 +16,11 @@ msgid "Maximum video resolution"
 msgstr ""
 
 msgctxt "#30002"
-msgid "YouTube offers videos up to this resolution. Auto uses the resolution the TV runs at when TizenTube starts."
+msgid "YouTube offers videos up to this resolution. Auto uses the largest of the TV's resolution when TizenTube starts and the display modes for auto frame rate."
 msgstr ""
 
 msgctxt "#30003"
-msgid "Auto (current display mode)"
+msgid "Auto (largest display mode)"
 msgstr ""
 
 msgctxt "#30004"
@@ -48,7 +48,7 @@ msgid "Display modes to switch to"
 msgstr ""
 
 msgctxt "#30012"
-msgid "When auto frame rate is on in TizenTube's settings, the TV switches to the refresh rate of the video, using only these modes at the current resolution."
+msgid "When auto frame rate is on in TizenTube's settings, the TV switches to the refresh rate of the video, and to its resolution when one of these modes has it. Otherwise it keeps the current resolution."
 msgstr ""
 
 msgctxt "#30013"

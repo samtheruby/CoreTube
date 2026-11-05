@@ -1,0 +1,1084 @@
+From e6580874391cf5289fea9f2889a287ede9cb8c7d Mon Sep 17 00:00:00 2001
+From: samtheruby <peasea1012@gmail.com>
+Date: Thu, 5 Nov 2026 21:09:32 +0000
+Subject: [PATCH] feat(coreelec): auto frame rate switches resolution too
+
+Kodi switches the display to a video's own resolution when its whitelist
+has that resolution; TizenTube's auto frame rate only changed the refresh
+rate. Now the page script adds the height of the best quality YouTube can
+play (getAvailableQualityData) to TizenTube's SetFrameRate, and the display
+extension (version 2, SetVideoFormat) switches to an allowed mode of that
+height first, 16:9 before 4096 wide. Otherwise it keeps the current
+resolution and changes only the rate, as before.
+
+YouTube offers no quality above what the display shows, so the platform now
+reports the largest mode auto frame rate may use (current, original or
+allowed); a 4K video on a 1080p desktop can then ask for 2160p.
+
+On framebuffer windows the switch points fb0's scaler at the new mode. On
+DRM the window keeps its size and an atomic commit scales the primary
+plane to the mode (checked on the Xiaomi stick: 1080p window in 2160p24,
+page flips keep the scaling); the hotplug check keeps the current mode's
+size. After a resolution switch players place their video again, and on
+DRM its rectangle is scaled to the mode.
+---
+ .../h5vcc_tizentube/h5vcc_tizentube_impl.cc   |  11 +-
+ .../h5vcc_tizentube/h5vcc_tizentube_impl.h    |   2 +-
+ .../public/mojom/h5vcc_tizentube.mojom        |   3 +-
+ .../coretube_sabr.js                          |  26 +++
+ .../coreelec/tests/coreelec_display_test.cc   |  80 +++++++
+ .../starboard/rdk/shared/coreelec_display.cc  | 203 ++++++++++++++++--
+ .../starboard/rdk/shared/coreelec_display.h   |  44 +++-
+ .../starboard/rdk/shared/coreelec_gbm.cc      | 148 ++++++++++++-
+ .../starboard/rdk/shared/coreelec_gbm.h       |  24 ++-
+ .../rdk/shared/player/player_internal.cc      |  35 ++-
+ starboard/extension/tizentube_display.h       |   6 +
+ .../h5vcc_tizen_tube/h_5_vcc_tizen_tube.cc    |   4 +-
+ .../h5vcc_tizen_tube/h_5_vcc_tizen_tube.h     |   2 +-
+ .../h5vcc_tizen_tube/h_5_vcc_tizen_tube.idl   |   3 +-
+ 14 files changed, 540 insertions(+), 51 deletions(-)
+
+diff --git a/cobalt/browser/h5vcc_tizentube/h5vcc_tizentube_impl.cc b/cobalt/browser/h5vcc_tizentube/h5vcc_tizentube_impl.cc
+index 461cdd12173..1fbed977850 100644
+--- a/cobalt/browser/h5vcc_tizentube/h5vcc_tizentube_impl.cc
++++ b/cobalt/browser/h5vcc_tizentube/h5vcc_tizentube_impl.cc
+@@ -100,7 +100,7 @@ void H5vccTizentubeImpl::GetBrandAndModel(GetBrandAndModelCallback callback) {
+   #endif  // BUILDFLAG(IS_ANDROID)
+ }
+ 
+-void H5vccTizentubeImpl::SetFrameRate(float frame_rate) {
++void H5vccTizentubeImpl::SetFrameRate(float frame_rate, int32_t video_height) {
+   #if BUILDFLAG(IS_ANDROID)
+     JNIEnv* env = AttachCurrentThread();
+     StarboardBridge::GetInstance()->SetFrameRate(env, frame_rate);
+@@ -108,9 +108,12 @@ void H5vccTizentubeImpl::SetFrameRate(float frame_rate) {
+     // Other platforms switch the display through a Starboard extension.
+     auto* display = static_cast<const TizenTubeExtensionDisplayApi*>(
+         SbSystemGetExtension(kTizenTubeExtensionDisplayName));
+-    if (display && strcmp(display->name, kTizenTubeExtensionDisplayName) == 0 &&
+-        display->version >= 1) {
+-      display->SetFrameRate(frame_rate);
++    if (display && strcmp(display->name, kTizenTubeExtensionDisplayName) == 0) {
++      if (display->version >= 2) {
++        display->SetVideoFormat(frame_rate, video_height);
++      } else if (display->version >= 1) {
++        display->SetFrameRate(frame_rate);
++      }
+     }
+   #endif  // BUILDFLAG(IS_ANDROID)
+ }
+diff --git a/cobalt/browser/h5vcc_tizentube/h5vcc_tizentube_impl.h b/cobalt/browser/h5vcc_tizentube/h5vcc_tizentube_impl.h
+index 83f807625e0..e865f21ed9b 100644
+--- a/cobalt/browser/h5vcc_tizentube/h5vcc_tizentube_impl.h
++++ b/cobalt/browser/h5vcc_tizentube/h5vcc_tizentube_impl.h
+@@ -45,7 +45,7 @@ class H5vccTizentubeImpl
+   void GetVersion(GetVersionCallback callback) override;
+   void GetArchitecture(GetArchitectureCallback callback) override;
+   void GetBrandAndModel(GetBrandAndModelCallback callback) override;
+-  void SetFrameRate(float frame_rate) override;
++  void SetFrameRate(float frame_rate, int32_t video_height) override;
+   void SetUserAgent(const std::string& user_agent) override;
+ 
+  private:
+diff --git a/cobalt/browser/h5vcc_tizentube/public/mojom/h5vcc_tizentube.mojom b/cobalt/browser/h5vcc_tizentube/public/mojom/h5vcc_tizentube.mojom
+index 64230c98eae..ec49b851d3e 100644
+--- a/cobalt/browser/h5vcc_tizentube/public/mojom/h5vcc_tizentube.mojom
++++ b/cobalt/browser/h5vcc_tizentube/public/mojom/h5vcc_tizentube.mojom
+@@ -19,6 +19,7 @@ interface H5vccTizentube {
+   GetVersion() => (string version);
+   GetArchitecture() => (string architecture);
+   GetBrandAndModel() => (string brand_and_model);
+-  SetFrameRate(float frame_rate);
++  // video_height: the best quality's height, 0 when unknown.
++  SetFrameRate(float frame_rate, int32 video_height);
+   SetUserAgent(string user_agent);
+ };
+diff --git a/cobalt/shell/embedded_resources/cobalt_java_script_polyfill/coretube_sabr.js b/cobalt/shell/embedded_resources/cobalt_java_script_polyfill/coretube_sabr.js
+index 81ede91091f..635dbfbd8f1 100644
+--- a/cobalt/shell/embedded_resources/cobalt_java_script_polyfill/coretube_sabr.js
++++ b/cobalt/shell/embedded_resources/cobalt_java_script_polyfill/coretube_sabr.js
+@@ -12,6 +12,7 @@
+ //   a seek), instead of playing a second and stalling again.
+ // Home screen video previews are off unless the add-on turns them on: a preview
+ // starting can flash the screen white for a moment (cause unknown).
++// TizenTube's auto frame rate also tells Cobalt the video's best resolution.
+ (function () {
+   'use strict';
+   if (window.__coretubeSabr || !/(^|\.)youtube\.com$/.test(location.hostname)) return;
+@@ -56,6 +57,31 @@
+   };
+   setPreviewFlag();
+ 
++  // --- Auto frame rate: the video's resolution too --------------------------
++  // TizenTube passes only the frame rate. Add the height of the best quality
++  // YouTube can play for this video (0 when unknown), so Cobalt can also switch
++  // the display to that resolution when Kodi's whitelist has it.
++  var bestVideoHeight = function () {
++    try {
++      var player = document.querySelector('.html5-video-player');
++      var qualities = (player && player.getAvailableQualityData && player.getAvailableQualityData()) || [];
++      return qualities.reduce(function (best, q) {
++        return q.isPlayable === false ? best : Math.max(best, parseInt(q.qualityLabel, 10) || 0);
++      }, 0);
++    } catch (e) {
++      log('cannot read the video qualities: ' + e);
++      return 0;
++    }
++  };
++  var tizentube = window.h5vcc && window.h5vcc.tizentube;
++  var tizentubeApi = tizentube && Object.getPrototypeOf(tizentube);
++  if (tizentubeApi && typeof tizentubeApi.SetFrameRate === 'function') {
++    var origSetFrameRate = tizentubeApi.SetFrameRate;
++    tizentubeApi.SetFrameRate = function (frameRate) {
++      return origSetFrameRate.call(this, frameRate, frameRate > 0 ? bestVideoHeight() : 0);
++    };
++  }
++
+   // --- Keep slow downloads alive -------------------------------------------
+   var downloads = new WeakMap();  // AbortSignal -> {start, last, done}
+   var origFetch = window.fetch;
+diff --git a/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/tests/coreelec_display_test.cc b/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/tests/coreelec_display_test.cc
+index 5e9e816e9b1..a27888079db 100644
+--- a/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/tests/coreelec_display_test.cc
++++ b/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/tests/coreelec_display_test.cc
+@@ -55,6 +55,50 @@ int main() {
+   assert(!ChooseModeSwitch("", "1080p60hz", false, caps, 24));             // no allowed modes
+   assert(!ChooseModeSwitch(modes, "1080i60hz", false, caps, 24));          // interlaced now
+   assert(!ChooseModeSwitch(modes, "1080p60hz", false, caps, 0));
++  s = ChooseModeSwitch(modes, "1080p60hz", false, caps, 24);
++  assert(s && s->width == 1920 && s->height == 1080);  // the mode's size, for the scaler
++
++  // Kodi's whitelist has the video's resolution (its best quality's height): the
++  // display switches to that resolution too, down or up.
++  const std::string both =
++      "3840x2160@60 3840x2160@24 3840x2160@23.976 "
++      "1920x1080@60 1920x1080@24 1920x1080@23.976 1920x1080@50";
++  const std::string tv = "2160p60hz*\n2160p24hz\nsmpte24hz\n1080p60hz\n1080p24hz\n1080p50hz\n";
++  s = ChooseModeSwitch(both, "2160p60hz", false, tv, 23.976, nullptr, 1080);
++  assert(s && s->name == "1080p24hz" && s->fractional && s->width == 1920 &&
++         s->height == 1080 && s->suffix.empty());
++  s = ChooseModeSwitch(both, "1080p60hz", false, tv, 24, nullptr, 2160);
++  assert(s && s->name == "2160p24hz" && !s->fractional && s->width == 3840 && s->height == 2160);
++  // 16:9 before 4096 wide; 4096 wide when it is the only one at that height.
++  s = ChooseModeSwitch(both + " 4096x2160@24", "1080p60hz", false, tv, 24, nullptr, 2160);
++  assert(s && s->name == "2160p24hz");
++  s = ChooseModeSwitch("4096x2160@24 1920x1080@60", "1080p60hz", false, tv, 24, nullptr, 2160);
++  assert(s && s->name == "smpte24hz" && s->width == 4096);
++  // The video's height is the current one: only the rate, the suffix kept.
++  s = ChooseModeSwitch(both, "1080p60hz420", false, tv, 24, nullptr, 1080);
++  assert(s && s->name == "1080p24hz" && s->suffix == "420");
++  assert(!ChooseModeSwitch(both, "1080p24hz", false, tv, 24, nullptr, 1080));  // already there
++  // Otherwise the rate at the current resolution, as before: the height is not
++  // whitelisted, no rate there fits, or the TV does not list the mode.
++  s = ChooseModeSwitch(both, "2160p60hz", false, tv, 24, nullptr, 1440);
++  assert(s && s->name == "2160p24hz" && s->width == 3840);
++  s = ChooseModeSwitch(both, "1080p60hz", false, tv, 25, nullptr, 2160);
++  assert(s && s->name == "1080p50hz" && s->width == 1920);
++  s = ChooseModeSwitch(both, "1080p60hz", false, "1080p60hz*\n1080p24hz\n", 24, nullptr, 2160);
++  assert(s && s->name == "1080p24hz");
++
++  // YouTube offers no quality above what the display shows. It is told the
++  // largest picture auto frame rate may show: the current mode, the mode before
++  // the first switch, or an allowed mode.
++  auto size = LargestVideoSize("1080p60hz", "", both);
++  assert(size && size->width == 3840 && size->height == 2160);
++  size = LargestVideoSize("1080p24hz", "2160p60hz", "1920x1080@24");
++  assert(size && size->width == 3840);
++  size = LargestVideoSize("1080p60hz", "", "");
++  assert(size && size->width == 1920 && size->height == 1080);
++  size = LargestVideoSize("2160p60hz", "", "4096x2160@24");
++  assert(size && size->width == 4096);
++  assert(!LargestVideoSize("", "", ""));
+ 
+   // Frame rate 0 (no video, or a new one coming) goes back to the mode before
+   // auto frame rate first switched, as Android drops a video surface's rate,
+@@ -145,6 +189,23 @@ int main() {
+   s = watch.Restore("1080p24hz", false, t0 + 30s + delay);
+   assert(s && s->name == "1080p60hz");
+ 
++  // A resolution switch goes back to the resolution from before; the height is
++  // replayed with the rate when fullscreen bounds arrive later.
++  AutoFrameRate sized;
++  assert(!sized.Choose(both, "2160p60hz", false, tv, 24, t0, nullptr, 1080));  // not full screen yet
++  assert(sized.frame_rate() == 24 && sized.video_height() == 1080);
++  sized.SetVideosOnScreen(1, t0);
++  s = sized.Choose(both, "2160p60hz", false, tv, sized.frame_rate(), t0, nullptr,
++                   sized.video_height());
++  assert(s && s->name == "1080p24hz" && s->width == 1920);
++  assert(sized.original() && sized.original()->name == "2160p60hz");
++  sized.SetVideosOnScreen(0, t0 + 1s);
++  sized.Choose(both, "1080p24hz", false, tv, 0, t0 + 1s);
++  assert(sized.video_height() == 0);
++  s = sized.Restore("1080p24hz", false, t0 + 1s + delay);
++  assert(s && s->name == "2160p60hz" && s->width == 3840 && s->height == 2160);
++  assert(!sized.original());
++
+   // Full screen: the bounds cover the whole window (the watch page); a home screen
+   // preview is a window inside it.
+   assert(CoversWindow(0, 0, 1920, 1080, 1920, 1080));
+@@ -156,6 +217,25 @@ int main() {
+   SetWindowSize(1920, 1080);
+   assert(FillsWindow(0, 0, 1920, 1080) && !FillsWindow(100, 100, 640, 360));
+ 
++  // The video's rectangle in the sink's pixels. A framebuffer window leaves it in
++  // window pixels (the sink applies fb0's scaler); a DRM window (one with a mode
++  // setter) scales it to the output mode, which can differ from the window.
++  int x = 100, y = 50, w = 640, h = 360;
++  ScaleRect(x, y, w, h, 1920, 1080, 3840, 2160);
++  assert(x == 200 && y == 100 && w == 1280 && h == 720);
++  ScaleRect(x, y, w, h, 0, 0, 3840, 2160);  // no window size: left alone
++  assert(x == 200 && w == 1280);
++  const int generation = DisplayGeneration();
++  DisplayModeChanged(3840, 2160);
++  assert(DisplayGeneration() == generation + 1);  // players place their video again
++  x = 0, y = 0, w = 1920, h = 1080;
++  ToSinkRect(x, y, w, h);
++  assert(w == 1920 && h == 1080);  // framebuffer window
++  SetModeSetter([](const ModeSwitch&) { return true; });
++  ToSinkRect(x, y, w, h);
++  assert(x == 0 && y == 0 && w == 3840 && h == 2160);
++  SetModeSetter(nullptr);
++
+   // The mode for a WxH picture after the display changed (hotplug, another TV).
+   std::vector<OutputMode> outputs = {
+       {"2160p60hz", 3840, 2160, false, 60}, {"1080i60hz", 1920, 1080, true, 60},
+diff --git a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.cc b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.cc
+index 9afe29ecc7b..0905f27f442 100644
+--- a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.cc
++++ b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.cc
+@@ -26,6 +26,8 @@ constexpr char kDisplayCapsPath[] = "/sys/class/amhdmitx/amhdmitx0/disp_cap";
+ constexpr char kHdrCapsPath[] = "/sys/class/amhdmitx/amhdmitx0/hdr_cap";
+ constexpr char kFracRatePath[] = "/sys/class/amhdmitx/amhdmitx0/frac_rate_policy";
+ constexpr char kVideoMutePath[] = "/sys/class/amhdmitx/amhdmitx0/vid_mute";
++constexpr char kFreeScalePath[] = "/sys/class/graphics/fb0/free_scale";
++constexpr char kWindowAxisPath[] = "/sys/class/graphics/fb0/window_axis";
+ // How long HDMI video stays muted after a refresh rate switch.
+ constexpr auto kSwitchMute = std::chrono::seconds(1);
+ 
+@@ -67,6 +69,36 @@ bool DisplayTakes(const std::string& display_caps, const std::string& name) {
+   return false;
+ }
+ 
++// disp_cap's name for a progressive |width|x|height| mode at |rate| whole Hz.
++std::optional<std::string> DisplayName(const std::string& display_caps,
++                                       int width,
++                                       int height,
++                                       int rate) {
++  std::istringstream lines(display_caps);
++  for (std::string line; std::getline(lines, line);) {
++    line.erase(line.find_last_not_of(" *\t\r") + 1);
++    auto mode = ParseMode(line);
++    if (mode && !mode->interlaced && mode->suffix.empty() && mode->width == width &&
++        mode->height == height && mode->rate == rate) {
++      return line;
++    }
++  }
++  return {};
++}
++
++// The page is drawn at the framebuffer's size and fb0's scaler stretches it to
++// the screen (tizentube-start sets it up). After a switch to another resolution,
++// point the scaler at the new size, in the order Kodi's aml_enable_freeScale uses.
++void ScaleFramebufferTo(int width, int height) {
++  if (width <= 0 || height <= 0 || ReadFile(kFreeScalePath).empty()) {
++    return;
++  }
++  WriteFile(kFreeScalePath, "0");
++  WriteFile(kWindowAxisPath,
++            "0 0 " + std::to_string(width - 1) + " " + std::to_string(height - 1));
++  WriteFile(kFreeScalePath, "0x10001");
++}
++
+ std::mutex g_setter_mutex;
+ ModeSetter g_setter;
+ 
+@@ -99,11 +131,18 @@ void Switch(const ModeSwitch& target) {
+   }
+   g_mutes += WriteFile(kVideoMutePath, "1");
+   if (setter) {
++    // The DRM window reports the new mode once it shows it (DisplayModeChanged).
+     if (!setter(target)) {
+       SB_LOG(WARNING) << "Auto frame rate: the display cannot switch to " << target.name;
+     }
+-  } else if (WriteFile(kFracRatePath, target.fractional ? "1" : "0")) {
+-    WriteFile(kModePath, target.name + target.suffix);
++  } else {
++    auto before = ParseMode(ReadFile(kModePath));
++    if (WriteFile(kFracRatePath, target.fractional ? "1" : "0") &&
++        WriteFile(kModePath, target.name + target.suffix) && before &&
++        (before->width != target.width || before->height != target.height)) {
++      ScaleFramebufferTo(target.width, target.height);
++      DisplayModeChanged(target.width, target.height);
++    }
+   }
+   g_mutes += WriteFile(kVideoMutePath, "1");
+   g_unmute_at = AutoFrameRate::Clock::now() + kSwitchMute;
+@@ -162,16 +201,18 @@ class FrameRateThread {
+ FrameRateThread g_frame_rate_thread;
+ 
+ // Called with g_frame_rate_mutex held, including when fullscreen bounds arrive.
+-void SetFrameRateLocked(double frame_rate) {
++void SetFrameRateLocked(double frame_rate, int video_height) {
+   const char* allowed = getenv("TIZENTUBE_DISPLAY_MODES");
+   std::string why;
+   auto target = g_frame_rate.Choose(allowed ? allowed : "", ReadFile(kModePath),
+                                     ReadFile(kFracRatePath) == "1",
+                                     ReadFile(kDisplayCapsPath), frame_rate,
+-                                    AutoFrameRate::Clock::now(), &why);
++                                    AutoFrameRate::Clock::now(), &why, video_height);
+   if (target) {
+-    SB_LOG(INFO) << "Auto frame rate: " << frame_rate << " fps, switching to "
+-                 << target->name << (target->fractional ? " (1000/1001)" : "");
++    SB_LOG(INFO) << "Auto frame rate: " << frame_rate << " fps, "
++                 << (video_height > 0 ? std::to_string(video_height) + "p video, " : "")
++                 << "switching to " << target->name
++                 << (target->fractional ? " (1000/1001)" : "");
+     Switch(*target);
+   } else if (!why.empty()) {
+     SB_LOG(INFO) << "Auto frame rate: " << why;
+@@ -180,26 +221,41 @@ void SetFrameRateLocked(double frame_rate) {
+   g_frame_rate_wake.notify_all();
+ }
+ 
+-void SetFrameRate(float frame_rate) {
++void SetVideoFormat(float frame_rate, int video_height) {
+   std::lock_guard<std::mutex> lock(g_frame_rate_mutex);
+-  SetFrameRateLocked(frame_rate);
++  SetFrameRateLocked(frame_rate, video_height);
++}
++
++void SetFrameRate(float frame_rate) {
++  SetVideoFormat(frame_rate, 0);
+ }
+ 
+ const TizenTubeExtensionDisplayApi kDisplayApi = {
+     kTizenTubeExtensionDisplayName,
+-    1,
++    2,
+     &SetFrameRate,
++    &SetVideoFormat,
+ };
+ 
+ class CoreELECInterface final : public platform::PlatformInterface {
+   struct Device final : public platform::IDevice {
+     std::optional<platform::Resolution> video_resolution() override {
+-      auto mode = ParseMode(ReadFile(kModePath));
+-      if (!mode) {
++      std::string original;
++      {
++        std::lock_guard<std::mutex> lock(g_frame_rate_mutex);
++        if (g_frame_rate.original()) {
++          original = g_frame_rate.original()->name;
++        }
++      }
++      // Auto frame rate may switch to a larger mode for the video: let YouTube
++      // offer that quality, or it never asks for that mode.
++      const char* allowed = getenv("TIZENTUBE_DISPLAY_MODES");
++      auto size = LargestVideoSize(ReadFile(kModePath), original, allowed ? allowed : "");
++      if (!size) {
+         return {};
+       }
+-      int width = mode->width;
+-      int height = mode->height;
++      int width = size->width;
++      int height = size->height;
+       // The add-on's "maximum video resolution" setting.
+       const char* max = getenv("TIZENTUBE_MAX_VIDEO_HEIGHT");
+       int max_height = max ? atoi(max) : 0;
+@@ -351,7 +407,8 @@ std::optional<ModeSwitch> ChooseModeSwitch(const std::string& allowed,
+                                            bool current_fractional,
+                                            const std::string& display_caps,
+                                            double frame_rate,
+-                                           std::string* why) {
++                                           std::string* why,
++                                           int video_height) {
+   auto explain = [why](const std::string& text) {
+     if (why) {
+       *why = text;
+@@ -365,8 +422,33 @@ std::optional<ModeSwitch> ChooseModeSwitch(const std::string& allowed,
+   if (allowed.empty() || !current || current->interlaced) {
+     return explain("no display modes to switch to");
+   }
+-  double rate = ChooseRefreshRate(ParseAllowedModes(allowed), current->width,
+-                                  current->height, frame_rate);
++  const std::vector<AllowedMode> modes = ParseAllowedModes(allowed);
++  // As Kodi: the video's own resolution first, when it is allowed.
++  if (video_height > 0 && video_height != current->height) {
++    std::vector<int> widths;
++    for (const AllowedMode& mode : modes) {
++      if (mode.height == video_height &&
++          std::find(widths.begin(), widths.end(), mode.width) == widths.end()) {
++        widths.push_back(mode.width);
++      }
++    }
++    const int wide = video_height * 16 / 9;
++    std::stable_sort(widths.begin(), widths.end(), [wide](int a, int b) {
++      return std::abs(a - wide) < std::abs(b - wide);
++    });
++    for (int width : widths) {
++      double rate = ChooseRefreshRate(modes, width, video_height, frame_rate);
++      if (rate <= 0) {
++        continue;
++      }
++      int whole = static_cast<int>(std::lround(rate));
++      auto name = DisplayName(display_caps, width, video_height, whole);
++      if (name) {
++        return ModeSwitch{*name, std::fabs(rate - whole) > 0.01, "", width, video_height};
++      }
++    }
++  }
++  double rate = ChooseRefreshRate(modes, current->width, current->height, frame_rate);
+   if (rate <= 0) {
+     std::ostringstream text;
+     text << "no allowed mode fits " << frame_rate << " fps at " << current->width
+@@ -380,21 +462,45 @@ std::optional<ModeSwitch> ChooseModeSwitch(const std::string& allowed,
+     return std::nullopt;
+   }
+   ModeSwitch target{current->prefix + std::to_string(whole) + "hz", fractional,
+-                    current->suffix};
++                    current->suffix, current->width, current->height};
+   if (!DisplayTakes(display_caps, target.name)) {
+     return explain("the TV does not list " + target.name);
+   }
+   return target;
+ }
+ 
++std::optional<platform::Resolution> LargestVideoSize(const std::string& current,
++                                                     const std::string& original,
++                                                     const std::string& allowed) {
++  std::optional<platform::Resolution> largest;
++  auto consider = [&largest](int width, int height) {
++    if (width > 0 && height > 0 &&
++        (!largest || height > largest->height ||
++         (height == largest->height && width > largest->width))) {
++      largest = platform::Resolution(width, height);
++    }
++  };
++  for (const std::string* name : {&current, &original}) {
++    if (auto mode = ParseMode(*name)) {
++      consider(mode->width, mode->height);
++    }
++  }
++  for (const AllowedMode& mode : ParseAllowedModes(allowed)) {
++    consider(mode.width, mode.height);
++  }
++  return largest;
++}
++
+ std::optional<ModeSwitch> AutoFrameRate::Choose(const std::string& allowed,
+                                                 const std::string& current,
+                                                 bool current_fractional,
+                                                 const std::string& display_caps,
+                                                 double frame_rate,
+                                                 Clock::time_point now,
+-                                                std::string* why) {
++                                                std::string* why,
++                                                int video_height) {
+   frame_rate_ = frame_rate;
++  video_height_ = frame_rate > 0 ? video_height : 0;
+   if (!(frame_rate > 0)) {
+     if (original_ && !restore_at_ && videos_on_screen_ == 0) {
+       restore_at_ = now + kRestoreDelay;
+@@ -406,11 +512,12 @@ std::optional<ModeSwitch> AutoFrameRate::Choose(const std::string& allowed,
+   }
+   restore_at_.reset();
+   auto target = ChooseModeSwitch(allowed, current, current_fractional,
+-                                 display_caps, frame_rate, why);
++                                 display_caps, frame_rate, why, video_height);
+   auto mode = ParseMode(current);
+   if (target && !original_ && mode) {
+     original_ = ModeSwitch{mode->prefix + std::to_string(mode->rate) + "hz",
+-                           current_fractional, mode->suffix};
++                           current_fractional, mode->suffix, mode->width,
++                           mode->height};
+   }
+   return target;
+ }
+@@ -470,7 +577,7 @@ void SetVideoOnScreen(bool on_screen) {
+   videos = std::max(0, videos + (on_screen ? 1 : -1));
+   g_frame_rate.SetVideosOnScreen(videos, AutoFrameRate::Clock::now());
+   if (on_screen) {
+-    SetFrameRateLocked(g_frame_rate.frame_rate());
++    SetFrameRateLocked(g_frame_rate.frame_rate(), g_frame_rate.video_height());
+   }
+   g_frame_rate_thread.Start();
+   g_frame_rate_wake.notify_all();
+@@ -481,6 +588,60 @@ void SetModeSetter(ModeSetter setter) {
+   g_setter = std::move(setter);
+ }
+ 
++namespace {
++std::mutex g_output_mutex;
++int g_output_width = 0;  // the mode on screen, once DisplayModeChanged says
++int g_output_height = 0;
++std::atomic<int> g_display_generation{0};
++}  // namespace
++
++void DisplayModeChanged(int width, int height) {
++  {
++    std::lock_guard<std::mutex> lock(g_output_mutex);
++    g_output_width = width;
++    g_output_height = height;
++  }
++  g_display_generation++;
++}
++
++int DisplayGeneration() {
++  return g_display_generation;
++}
++
++void ScaleRect(int& x, int& y, int& width, int& height,
++               int from_width, int from_height, int to_width, int to_height) {
++  if (from_width <= 0 || from_height <= 0 || to_width <= 0 || to_height <= 0) {
++    return;
++  }
++  // Scale the edges, so neighbouring rectangles still meet.
++  auto scale = [](int value, int to, int from) {
++    return static_cast<int>(static_cast<int64_t>(value) * to / from);
++  };
++  const int right = scale(x + width, to_width, from_width);
++  const int bottom = scale(y + height, to_height, from_height);
++  x = scale(x, to_width, from_width);
++  y = scale(y, to_height, from_height);
++  width = right - x;
++  height = bottom - y;
++}
++
++void ToSinkRect(int& x, int& y, int& width, int& height) {
++  {
++    std::lock_guard<std::mutex> lock(g_setter_mutex);
++    if (!g_setter) {
++      return;
++    }
++  }
++  int output_width, output_height;
++  {
++    std::lock_guard<std::mutex> lock(g_output_mutex);
++    output_width = g_output_width;
++    output_height = g_output_height;
++  }
++  ScaleRect(x, y, width, height, g_window_width, g_window_height, output_width,
++            output_height);
++}
++
+ int ChooseOutputMode(const std::vector<OutputMode>& modes,
+                      int width,
+                      int height,
+diff --git a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.h b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.h
+index f0b2cfa5921..2bd60e6cb42 100644
+--- a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.h
++++ b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.h
+@@ -55,18 +55,31 @@ struct ModeSwitch {
+   std::string name;    // "1080p24hz", as DRM names the mode
+   bool fractional = false;
+   std::string suffix;  // kept from the current sysfs mode name ("420")
++  int width = 0;       // the mode's size, for the scaler
++  int height = 0;
+ };
+ 
+ // The switch that shows |frame_rate| best, from TIZENTUBE_DISPLAY_MODES
+ // (|allowed|), the current mode name and 1000/1001 state, and disp_cap's text
+-// (the modes the TV takes). Empty when there is nothing to switch; |why| then
+-// says why, when given.
++// (the modes the TV takes). Like Kodi, it first tries the video's own
++// resolution: an allowed mode |video_height| lines high (16:9 first). Otherwise,
++// or for a |video_height| of 0, it keeps the current resolution. Empty when there
++// is nothing to switch; |why| then says why, when given.
+ std::optional<ModeSwitch> ChooseModeSwitch(const std::string& allowed,
+                                            const std::string& current,
+                                            bool current_fractional,
+                                            const std::string& display_caps,
+                                            double frame_rate,
+-                                           std::string* why = nullptr);
++                                           std::string* why = nullptr,
++                                           int video_height = 0);
++
++// The largest picture auto frame rate may show: the |current| mode, the
++// |original| one from before the first switch (may be empty), or an |allowed|
++// mode. YouTube offers no quality above what the display shows, so it is told
++// this size. Empty when none of them parses.
++std::optional<platform::Resolution> LargestVideoSize(const std::string& current,
++                                                     const std::string& original,
++                                                     const std::string& allowed);
+ 
+ // Auto frame rate across videos: remembers the mode it first switched away from.
+ class AutoFrameRate {
+@@ -87,10 +100,15 @@ class AutoFrameRate {
+                                    const std::string& display_caps,
+                                    double frame_rate,
+                                    Clock::time_point now,
+-                                   std::string* why = nullptr);
++                                   std::string* why = nullptr,
++                                   int video_height = 0);
+ 
+   // Replay the latest request when fullscreen bounds arrive after the rate.
+   double frame_rate() const { return frame_rate_; }
++  int video_height() const { return video_height_; }
++
++  // The mode before the first switch, while one is to go back to.
++  const std::optional<ModeSwitch>& original() const { return original_; }
+ 
+   // How many full-screen videos are on screen. Each keeps the display's rate (as
+   // a video surface does on Android): it cancels a pending return, and when the
+@@ -111,6 +129,7 @@ class AutoFrameRate {
+   std::optional<Clock::time_point> restore_at_;
+   int videos_on_screen_ = 0;
+   double frame_rate_ = 0;
++  int video_height_ = 0;
+ };
+ 
+ // Auto frame rate with nothing playing: the display goes back to its mode from
+@@ -136,6 +155,23 @@ bool FillsWindow(int x, int y, int width, int height);
+ using ModeSetter = std::function<bool(const ModeSwitch&)>;
+ void SetModeSetter(ModeSetter setter);
+ 
++// The display now shows a |width|x|height| mode (a switch, or another TV). It
++// bumps DisplayGeneration(): players then place their video again, as its
++// rectangle on the screen depends on the mode.
++void DisplayModeChanged(int width, int height);
++int DisplayGeneration();
++
++// Scales a rectangle from a |from_width|x|from_height| area to a
++// |to_width|x|to_height| one; left alone when either size is unknown (0).
++void ScaleRect(int& x, int& y, int& width, int& height,
++               int from_width, int from_height, int to_width, int to_height);
++
++// A video's rectangle in window pixels, turned into the pixels amlvideosink
++// expects. On a framebuffer window it stays as it is: the sink scales it with
++// fb0's scaler, as the OSD is. A DRM window (one with a mode setter) is scaled to
++// the mode by the plane, so the rectangle is scaled from the window to the mode.
++void ToSinkRect(int& x, int& y, int& width, int& height);
++
+ // A mode the connected display offers, as DRM lists it.
+ struct OutputMode {
+   std::string name;  // Amlogic names DRM modes like the sysfs ones: "1080p24hz"
+diff --git a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_gbm.cc b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_gbm.cc
+index 355318d9df0..e216885842b 100644
+--- a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_gbm.cc
++++ b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_gbm.cc
+@@ -20,6 +20,25 @@ void Flipped(int, unsigned, unsigned, unsigned, void *waiting) {
+ 
+ using ConnectorPtr =
+     std::unique_ptr<drmModeConnector, decltype(&drmModeFreeConnector)>;
++
++// The ID of object |id|'s property |name|, and its value; 0 when it has none.
++uint32_t PropertyId(int fd, uint32_t id, uint32_t type, const char *name,
++                    uint64_t *value = nullptr) {
++  std::unique_ptr<drmModeObjectProperties,
++                  decltype(&drmModeFreeObjectProperties)>
++      properties(drmModeObjectGetProperties(fd, id, type),
++                 drmModeFreeObjectProperties);
++  for (uint32_t i = 0; properties && i < properties->count_props; ++i) {
++    std::unique_ptr<drmModePropertyRes, decltype(&drmModeFreeProperty)> property(
++        drmModeGetProperty(fd, properties->props[i]), drmModeFreeProperty);
++    if (property && !strcmp(property->name, name)) {
++      if (value)
++        *value = properties->prop_values[i];
++      return property->prop_id;
++    }
++  }
++  return 0;
++}
+ } // namespace
+ 
+ CoreelecGbm::~CoreelecGbm() { Close(); }
+@@ -36,6 +55,10 @@ bool CoreelecGbm::Open() {
+   };
+   if (fd_ < 0 || drmSetMaster(fd_) != 0)
+     return fail();
++  // Atomic commits show modes of another size than the window; without them
++  // only modes of the window's size are used.
++  const bool atomic = drmSetClientCap(fd_, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1) == 0 &&
++                      drmSetClientCap(fd_, DRM_CLIENT_CAP_ATOMIC, 1) == 0;
+   std::unique_ptr<drmModeRes, decltype(&drmModeFreeResources)> resources(
+       drmModeGetResources(fd_), drmModeFreeResources);
+   if (!resources)
+@@ -77,6 +100,8 @@ bool CoreelecGbm::Open() {
+     }
+     width_ = mode_.hdisplay;
+     height_ = mode_.vdisplay;
++    if (atomic)
++      FindPlane(*resources);
+     UseModes(*connector);
+   }
+   if (!connector_ || !width_ || !height_) {
+@@ -111,12 +136,65 @@ bool CoreelecGbm::Open() {
+   return true;
+ }
+ 
++void CoreelecGbm::FindPlane(const drmModeRes &resources) {
++  int index = -1;
++  for (int i = 0; i < resources.count_crtcs && i < 32; ++i) {
++    if (resources.crtcs[i] == crtc_)
++      index = i;
++  }
++  std::unique_ptr<drmModePlaneRes, decltype(&drmModeFreePlaneResources)> planes(
++      drmModeGetPlaneResources(fd_), drmModeFreePlaneResources);
++  Atomic found;
++  for (uint32_t i = 0; index >= 0 && planes && i < planes->count_planes && !found.plane;
++       ++i) {
++    std::unique_ptr<drmModePlane, decltype(&drmModeFreePlane)> plane(
++        drmModeGetPlane(fd_, planes->planes[i]), drmModeFreePlane);
++    uint64_t type = 0;
++    if (plane && (plane->possible_crtcs & (1u << index)) &&
++        PropertyId(fd_, plane->plane_id, DRM_MODE_OBJECT_PLANE, "type", &type) &&
++        type == DRM_PLANE_TYPE_PRIMARY)
++      found.plane = plane->plane_id;
++  }
++  if (!found.plane) {
++    fprintf(stderr, "coreelec-gbm: no primary plane, modes of the window's size only\n");
++    return;
++  }
++  auto plane = [this, &found](const char *name) {
++    return PropertyId(fd_, found.plane, DRM_MODE_OBJECT_PLANE, name);
++  };
++  found.connector_crtc =
++      PropertyId(fd_, connector_, DRM_MODE_OBJECT_CONNECTOR, "CRTC_ID");
++  found.mode = PropertyId(fd_, crtc_, DRM_MODE_OBJECT_CRTC, "MODE_ID");
++  found.active = PropertyId(fd_, crtc_, DRM_MODE_OBJECT_CRTC, "ACTIVE");
++  found.fb = plane("FB_ID");
++  found.plane_crtc = plane("CRTC_ID");
++  found.src_x = plane("SRC_X");
++  found.src_y = plane("SRC_Y");
++  found.src_w = plane("SRC_W");
++  found.src_h = plane("SRC_H");
++  found.crtc_x = plane("CRTC_X");
++  found.crtc_y = plane("CRTC_Y");
++  found.crtc_w = plane("CRTC_W");
++  found.crtc_h = plane("CRTC_H");
++  for (uint32_t id : {found.connector_crtc, found.mode, found.active, found.fb,
++                      found.plane_crtc, found.src_x, found.src_y, found.src_w,
++                      found.src_h, found.crtc_x, found.crtc_y, found.crtc_w,
++                      found.crtc_h}) {
++    if (!id) {
++      fprintf(stderr, "coreelec-gbm: missing atomic property, modes of the "
++                      "window's size only\n");
++      return;
++    }
++  }
++  atomic_ = found;
++}
++
+ void CoreelecGbm::UseModes(const drmModeConnector &connector) {
+   modes_.assign(connector.modes, connector.modes + connector.count_modes);
+   std::vector<std::string> names;
+   for (const auto &mode : modes_) {
+-    if (mode.hdisplay == width_ && mode.vdisplay == height_ &&
+-        !(mode.flags & DRM_MODE_FLAG_INTERLACE))
++    const bool same_size = mode.hdisplay == width_ && mode.vdisplay == height_;
++    if ((same_size || atomic_.plane) && !(mode.flags & DRM_MODE_FLAG_INTERLACE))
+       names.push_back(mode.name);
+   }
+   std::lock_guard<std::mutex> lock(request_mutex_);
+@@ -133,6 +211,49 @@ bool CoreelecGbm::RequestMode(const std::string &name, bool fractional) {
+   return true;
+ }
+ 
++bool CoreelecGbm::SetMode(uint32_t framebuffer) {
++  if (mode_.hdisplay == width_ && mode_.vdisplay == height_)
++    return drmModeSetCrtc(fd_, crtc_, framebuffer, 0, 0, &connector_, 1,
++                          &mode_) == 0;
++  if (!atomic_.plane) {
++    errno = EINVAL;
++    return false;
++  }
++  uint32_t blob = 0;
++  if (drmModeCreatePropertyBlob(fd_, &mode_, sizeof(mode_), &blob))
++    return false;
++  const struct {
++    uint32_t object, property;
++    uint64_t value;
++  } values[] = {
++      {connector_, atomic_.connector_crtc, crtc_},
++      {crtc_, atomic_.mode, blob},
++      {crtc_, atomic_.active, 1},
++      {atomic_.plane, atomic_.fb, framebuffer},
++      {atomic_.plane, atomic_.plane_crtc, crtc_},
++      {atomic_.plane, atomic_.src_x, 0},
++      {atomic_.plane, atomic_.src_y, 0},
++      {atomic_.plane, atomic_.src_w, static_cast<uint64_t>(width_) << 16},
++      {atomic_.plane, atomic_.src_h, static_cast<uint64_t>(height_) << 16},
++      {atomic_.plane, atomic_.crtc_x, 0},
++      {atomic_.plane, atomic_.crtc_y, 0},
++      {atomic_.plane, atomic_.crtc_w, mode_.hdisplay},
++      {atomic_.plane, atomic_.crtc_h, mode_.vdisplay},
++  };
++  drmModeAtomicReq *request = drmModeAtomicAlloc();
++  bool ok = request != nullptr;
++  for (const auto &value : values)
++    ok = ok && drmModeAtomicAddProperty(request, value.object, value.property,
++                                        value.value) >= 0;
++  ok = ok && drmModeAtomicCommit(fd_, request, DRM_MODE_ATOMIC_ALLOW_MODESET,
++                                 nullptr) == 0;
++  const int error = errno;
++  drmModeAtomicFree(request);
++  drmModeDestroyPropertyBlob(fd_, blob);
++  errno = error;
++  return ok;
++}
++
+ bool CoreelecGbm::SetFractional(bool fractional) {
+   if (!fractional_property_)
+     return false;
+@@ -171,8 +292,13 @@ void CoreelecGbm::CheckDisplay(bool now) {
+                        (mode.flags & DRM_MODE_FLAG_INTERLACE) != 0,
+                        static_cast<int>(mode.vrefresh)});
+   }
+-  int chosen = third_party::starboard::rdk::shared::coreelec::ChooseOutputMode(
+-      outputs, width_, height_, mode_.name);
++  // Keep the current mode's size (auto frame rate may have changed it), else
++  // the window's.
++  namespace coreelec = third_party::starboard::rdk::shared::coreelec;
++  int chosen = coreelec::ChooseOutputMode(outputs, mode_.hdisplay,
++                                          mode_.vdisplay, mode_.name);
++  if (chosen < 0 && (mode_.hdisplay != width_ || mode_.vdisplay != height_))
++    chosen = coreelec::ChooseOutputMode(outputs, width_, height_, mode_.name);
+   if (chosen < 0) {
+     if (!reported_no_mode_)
+       fprintf(stderr, "coreelec-gbm: the display has no %dx%d mode, waiting\n",
+@@ -271,8 +397,7 @@ bool CoreelecGbm::Present() {
+   bool switching = false;
+   if (ok && request) {
+     for (const auto &mode : modes_) {
+-      if (request->first != mode.name || mode.hdisplay != width_ ||
+-          mode.vdisplay != height_)
++      if (request->first != mode.name || (mode.flags & DRM_MODE_FLAG_INTERLACE))
+         continue;
+       if (request->second == fractional_ || SetFractional(request->second)) {
+         mode_ = mode;
+@@ -283,13 +408,15 @@ bool CoreelecGbm::Present() {
+     }
+   }
+   if (ok && !active_) {
+-    ok = drmModeSetCrtc(fd_, crtc_, framebuffer, 0, 0, &connector_, 1,
+-                        &mode_) == 0;
++    ok = SetMode(framebuffer);
+     active_ = ok;
+-    if (ok)
++    if (ok) {
+       fprintf(stderr, "coreelec-gbm: showing %s%s\n", mode_.name,
+               fractional_ ? " (1000/1001)" : "");
+-    else if (switching) {
++      // Players place their video for this mode.
++      third_party::starboard::rdk::shared::coreelec::DisplayModeChanged(
++          mode_.hdisplay, mode_.vdisplay);
++    } else if (switching) {
+       // The old mode and buffer are still on screen: keep flipping on them.
+       perror("coreelec-gbm mode switch");
+       mode_ = previous;
+@@ -367,6 +494,7 @@ void CoreelecGbm::Close() {
+   mode_ = start_mode_ = {};
+   modes_.clear();
+   fractional_property_ = 0;
++  atomic_ = {};
+   start_fractional_ = fractional_ = false;
+   connected_ = true;
+   reported_no_mode_ = false;
+diff --git a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_gbm.h b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_gbm.h
+index 08f892a892e..31677c1df6d 100644
+--- a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_gbm.h
++++ b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_gbm.h
+@@ -15,7 +15,8 @@
+ // The Cobalt window on a DRM display (CoreELEC Amlogic-no): GBM buffers shown
+ // by page flips. It switches refresh rates for auto frame rate and keeps going
+ // when the TV is unplugged, plugged in again or swapped. The window keeps the
+-// size it opened with; the display only changes rate.
++// size it opened with; a mode of another size (auto frame rate's resolution
++// switch) shows it scaled by the plane, set with an atomic commit.
+ class CoreelecGbm {
+ public:
+   CoreelecGbm() = default;
+@@ -26,8 +27,9 @@ public:
+   // Back to the mode and 1000/1001 state the display had at Open, then off.
+   void Close();
+   bool Present();
+-  // Switch to the same-size mode |name|, 1000/1001 slower when |fractional|,
+-  // on the next frame. False when the display has no such mode. Any thread.
++  // Switch to the progressive mode |name|, 1000/1001 slower when |fractional|,
++  // on the next frame. False when the display has no such mode, or it is of
++  // another size and the driver has no atomic modesetting. Any thread.
+   bool RequestMode(const std::string &name, bool fractional);
+   gbm_device *device() const { return device_; }
+   gbm_surface *surface() const { return surface_; }
+@@ -37,10 +39,16 @@ public:
+ private:
+   uint32_t Framebuffer(gbm_bo *buffer);
+   // Re-reads the connector (at most once a second unless |now|): stops showing
+-  // frames when the TV is gone, picks a mode of the window's size when one is back.
++  // frames when the TV is gone, picks a mode of the current size (else the
++  // window's) when one is back.
+   void CheckDisplay(bool now);
+   void UseModes(const drmModeConnector &connector);
++  // Finds the CRTC's primary plane and the atomic property IDs (atomic_).
++  void FindPlane(const drmModeRes &resources);
+   bool SetFractional(bool fractional);
++  // Shows |framebuffer| in mode_: a legacy mode set when the mode has the
++  // window's size, else an atomic commit whose plane scales the window to it.
++  bool SetMode(uint32_t framebuffer);
+   // Turns scanout off and gives both buffers back to the surface.
+   void Disable();
+   int fd_ = -1;
+@@ -59,7 +67,7 @@ private:
+   bool flip_waiting_ = false;
+   std::chrono::steady_clock::time_point next_check_{};
+   std::mutex request_mutex_;
+-  std::vector<std::string> mode_names_;  // same-size modes, for RequestMode
++  std::vector<std::string> mode_names_;  // modes RequestMode takes
+   std::optional<std::pair<std::string, bool>> request_;
+   gbm_device *device_ = nullptr;
+   gbm_surface *surface_ = nullptr;
+@@ -67,5 +75,11 @@ private:
+   gbm_bo *pending_ = nullptr;
+   bool active_ = false;
+   std::map<gbm_bo *, uint32_t> framebuffers_;
++  // Atomic modesetting: the primary plane and the property IDs (0: none).
++  struct Atomic {
++    uint32_t plane = 0, connector_crtc = 0, mode = 0, active = 0, fb = 0,
++             plane_crtc = 0, src_x = 0, src_y = 0, src_w = 0, src_h = 0,
++             crtc_x = 0, crtc_y = 0, crtc_w = 0, crtc_h = 0;
++  } atomic_;
+ };
+ #endif
+diff --git a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/player/player_internal.cc b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/player/player_internal.cc
+index f0d80665b91..1a9c4360c22 100644
+--- a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/player/player_internal.cc
++++ b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/player/player_internal.cc
+@@ -1427,6 +1427,9 @@ class PlayerImpl : public Player {
+   void AudioConfigurationChanged();
+ 
+  private:
++  // Hands |rect| to the video sink. Called with bounds_mutex_ held.
++  void ApplyBoundsLocked(const ::starboard::Rect& rect);
++
+   enum class State {
+     kNull,
+     kInitial,
+@@ -1705,6 +1708,10 @@ class PlayerImpl : public Player {
+   bool enforce_sw_decoders_ { false };
+   bool audio_passthrough_ { false };  // COREELEC: audio goes out as a bitstream
+   std::atomic<bool> on_screen_ { false };  // COREELEC: the video fills the screen
++  // The bounds the sink has, and the display mode they were placed for (COREELEC).
++  std::mutex bounds_mutex_;
++  ::starboard::Rect bounds_;
++  int display_generation_ { 0 };
+ };
+ 
+ struct PlayerRegistry
+@@ -2994,6 +3001,19 @@ bool PlayerImpl::SetRate(double rate) {
+ }
+ 
+ void PlayerImpl::GetInfo(SbPlayerInfo* out_player_info) {
++#if defined(COREELEC)
++  // The display switched modes since the video was placed: place it again, as
++  // its rectangle on the screen depends on the mode. Cobalt asks for the info
++  // several times a second while a video plays.
++  {
++    std::lock_guard lock(bounds_mutex_);
++    if (display_generation_ !=
++            ::third_party::starboard::rdk::shared::coreelec::DisplayGeneration() &&
++        !bounds_.IsEmpty()) {
++      ApplyBoundsLocked(bounds_);
++    }
++  }
++#endif
+ 
+   GstClockTime position;
+   {
+@@ -3046,6 +3066,15 @@ void PlayerImpl::SetBounds(int zindex, const ::starboard::Rect& rect) {
+     if (on_screen_.exchange(on_screen) != on_screen)
+       coreelec::SetVideoOnScreen(on_screen);
+   }
++#endif
++  std::lock_guard lock(bounds_mutex_);
++  ApplyBoundsLocked(rect);
++}
++
++void PlayerImpl::ApplyBoundsLocked(const ::starboard::Rect& rect) {
++#if defined(COREELEC)
++  bounds_ = rect;
++  display_generation_ = ::third_party::starboard::rdk::shared::coreelec::DisplayGeneration();
+ #endif
+   GstElement* vid_sink = nullptr;
+   g_object_get(pipeline_, "video-sink", &vid_sink, nullptr);
+@@ -3055,7 +3084,11 @@ void PlayerImpl::SetBounds(int zindex, const ::starboard::Rect& rect) {
+     return;
+   }
+   if (g_object_class_find_property(G_OBJECT_GET_CLASS(vid_sink), "rectangle")) {
+-    gchar* rect_str = g_strdup_printf("%d,%d,%d,%d", rect.x, rect.y, rect.size.width, rect.size.height);
++    int x = rect.x, y = rect.y, width = rect.size.width, height = rect.size.height;
++#if defined(COREELEC)
++    ::third_party::starboard::rdk::shared::coreelec::ToSinkRect(x, y, width, height);
++#endif
++    gchar* rect_str = g_strdup_printf("%d,%d,%d,%d", x, y, width, height);
+     g_object_set(vid_sink, "rectangle", rect_str, nullptr);
+     g_free(rect_str);
+   }
+diff --git a/starboard/extension/tizentube_display.h b/starboard/extension/tizentube_display.h
+index 86e395b4d73..6c7a715fb4c 100644
+--- a/starboard/extension/tizentube_display.h
++++ b/starboard/extension/tizentube_display.h
+@@ -27,6 +27,12 @@ typedef struct TizenTubeExtensionDisplayApi {
+   // |frame_rate| frames per second (TizenTube's auto frame rate). The platform
+   // decides which display modes it may use; it keeps the mode when none fits.
+   void (*SetFrameRate)(float frame_rate);
++
++  // The fields below this point were added in version 2 or later.
++
++  // SetFrameRate, plus the height of the best quality the video offers (0 when
++  // unknown): the platform may also switch to that resolution.
++  void (*SetVideoFormat)(float frame_rate, int video_height);
+ } TizenTubeExtensionDisplayApi;
+ 
+ #ifdef __cplusplus
+diff --git a/third_party/blink/renderer/modules/cobalt/h5vcc_tizen_tube/h_5_vcc_tizen_tube.cc b/third_party/blink/renderer/modules/cobalt/h5vcc_tizen_tube/h_5_vcc_tizen_tube.cc
+index 4289c2d77c1..467b50572a0 100644
+--- a/third_party/blink/renderer/modules/cobalt/h5vcc_tizen_tube/h_5_vcc_tizen_tube.cc
++++ b/third_party/blink/renderer/modules/cobalt/h5vcc_tizen_tube/h_5_vcc_tizen_tube.cc
+@@ -88,7 +88,7 @@ bool H5vccTizenTube::InstallAppFromURL(
+ #endif // BUILDFLAG(IS_ANDROID)
+ }
+ 
+-void H5vccTizenTube::SetFrameRate(float frame_rate) {
++void H5vccTizenTube::SetFrameRate(float frame_rate, int32_t video_height) {
+ #if BUILDFLAG(IS_ANDROID)
+   auto* env = base::android::AttachCurrentThread();
+   starboard::StarboardBridge* bridge = starboard::StarboardBridge::GetInstance();
+@@ -96,7 +96,7 @@ void H5vccTizenTube::SetFrameRate(float frame_rate) {
+ #else
+   // The browser side switches the display (h5vcc_tizentube_impl.cc).
+   if (EnsureReceiverIsBound()) {
+-    service_->SetFrameRate(frame_rate);
++    service_->SetFrameRate(frame_rate, video_height);
+   }
+ #endif // BUILDFLAG(IS_ANDROID)
+ }
+diff --git a/third_party/blink/renderer/modules/cobalt/h5vcc_tizen_tube/h_5_vcc_tizen_tube.h b/third_party/blink/renderer/modules/cobalt/h5vcc_tizen_tube/h_5_vcc_tizen_tube.h
+index ded24242622..61dc2e40698 100644
+--- a/third_party/blink/renderer/modules/cobalt/h5vcc_tizen_tube/h_5_vcc_tizen_tube.h
++++ b/third_party/blink/renderer/modules/cobalt/h5vcc_tizen_tube/h_5_vcc_tizen_tube.h
+@@ -56,7 +56,7 @@ class MODULES_EXPORT H5vccTizenTube final
+   WTF::String GetArchitecture(ScriptState* script_state,
+                              ExceptionState& exception_state);
+ 
+-  void SetFrameRate(float frame_rate);
++  void SetFrameRate(float frame_rate, int32_t video_height);
+   void EnterPIP();
+   bool SetUserAgent(ScriptState* script_state,
+                     const WTF::String& user_agent,
+diff --git a/third_party/blink/renderer/modules/cobalt/h5vcc_tizen_tube/h_5_vcc_tizen_tube.idl b/third_party/blink/renderer/modules/cobalt/h5vcc_tizen_tube/h_5_vcc_tizen_tube.idl
+index f808dfd2c47..7eda216fbd6 100644
+--- a/third_party/blink/renderer/modules/cobalt/h5vcc_tizen_tube/h_5_vcc_tizen_tube.idl
++++ b/third_party/blink/renderer/modules/cobalt/h5vcc_tizen_tube/h_5_vcc_tizen_tube.idl
+@@ -23,7 +23,8 @@ interface H5vccTizenTube {
+   DOMString GetVersion();
+   [CallWith=ScriptState, RaisesException]
+   DOMString GetArchitecture();
+-  void SetFrameRate(float frame_rate);
++  // video_height: the best quality's height (CoreTube's page script adds it).
++  void SetFrameRate(float frame_rate, optional long video_height = 0);
+   void EnterPIP();
+   [CallWith=ScriptState, RaisesException]
+   boolean SetUserAgent(DOMString user_agent);
+-- 
+2.47.3
+

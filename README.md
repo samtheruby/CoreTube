@@ -36,7 +36,7 @@ The CoreELEC build folder may already hold other CoreELEC work. CoreTube adds it
 
 In Kodi, open **Add-ons**, choose **Install from zip file**, and pick the zip. Then open TizenTube from **Add-ons**. Kodi comes back when you exit TizenTube.
 
-Auto frame rate changes the TV's display mode only for fullscreen videos. Preview cards do not trigger mode changes.
+Auto frame rate changes the TV's display mode only for fullscreen videos. Preview cards do not trigger mode changes. Like Kodi, it switches to the video's resolution when Kodi's whitelist has a mode at that resolution and a refresh rate that fits the video. Otherwise it keeps the current resolution and changes only the refresh rate. The video's resolution is the best quality YouTube offers for it. YouTube can offer qualities up to the largest whitelisted resolution, so a 4K video on a TV set to 1080p can switch it to 2160p.
 
 TizenTube tells YouTube it is a Fire TV Cube, because YouTube buffers much better for it. To send Cobalt's own user agent instead, put `export TIZENTUBE_USER_AGENT=''` in the add-on's `env` file (in Kodi's `userdata/addon_data/browser.tizentube` folder).
 

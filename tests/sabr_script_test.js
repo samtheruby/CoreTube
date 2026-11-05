@@ -230,6 +230,37 @@ async function watchPageOnly() {
   assert.strictEqual(x.paused, true, 'the next video can be held again');
 }
 
+// Auto frame rate: TizenTube's SetFrameRate(fps) also carries the height of the
+// best quality YouTube can play for the video, so the display can switch to it.
+async function frameRateCarriesVideoHeight() {
+  const calls = [];
+  class H5vccTizenTube {}
+  H5vccTizenTube.prototype.SetFrameRate = function (...args) { calls.push([this, ...args]); };
+  const tizentube = new H5vccTizenTube();
+  let qualities = [
+    { qualityLabel: '2160p60', quality: 'hd2160', isPlayable: false },
+    { qualityLabel: '1440p60', quality: 'hd1440', isPlayable: true },
+    { qualityLabel: '1080p60', quality: 'hd1080', isPlayable: true },
+    { qualityLabel: '480p', quality: 'large', isPlayable: true },
+  ];
+  const player = { getAvailableQualityData: () => qualities };
+  const p = page({ h5vcc: { tizentube } });
+  p.ctx.document.querySelector = (s) => (s === '.html5-video-player' ? player : null);
+
+  tizentube.SetFrameRate(23.976);
+  assert.deepStrictEqual(calls.pop(), [tizentube, 23.976, 1440], 'best playable quality, not 2160p');
+  tizentube.SetFrameRate(0);
+  assert.deepStrictEqual(calls.pop(), [tizentube, 0, 0], 'no video: no height');
+  qualities = [];
+  tizentube.SetFrameRate(24);
+  assert.deepStrictEqual(calls.pop(), [tizentube, 24, 0], 'no quality list yet: rate only');
+  player.getAvailableQualityData = () => { throw new Error('gone'); };
+  tizentube.SetFrameRate(24);
+  assert.deepStrictEqual(calls.pop(), [tizentube, 24, 0], 'a broken player: rate only');
+
+  page();  // no h5vcc.tizentube (not Cobalt): nothing to wrap, no error
+}
+
 async function onlyOnYouTube() {
   const ctx = { location: { hostname: 'h5vcc-embedded.example' }, console: { info() {} } };
   ctx.window = ctx;
@@ -238,7 +269,7 @@ async function onlyOnYouTube() {
 }
 
 (async () => {
-  for (const t of [keepAlive, abortsThatGoThrough, stallGate, userWins, videoPreviews, watchPageOnly, onlyOnYouTube]) {
+  for (const t of [keepAlive, abortsThatGoThrough, stallGate, userWins, videoPreviews, watchPageOnly, frameRateCarriesVideoHeight, onlyOnYouTube]) {
     await t();
     console.log(t.name + ': ok');
   }
