@@ -1,0 +1,53 @@
+From 94c0ee4c44fee6b08cb801e35f042f247b5f28da Mon Sep 17 00:00:00 2001
+From: samtheruby <peasea1012@gmail.com>
+Date: Thu, 5 Nov 2026 22:50:06 +0000
+Subject: [PATCH] fix(cobalt): keep the renderer's objects alive at stop on
+ Starboard
+
+On Starboard the in-process renderer thread is released, not joined, when
+the application stops (~RenderProcessHostImpl), so it can still run page
+tasks. DoStop then destroyed the CobaltMainDelegate, which owns the content
+renderer client, and the AtExitManager's singletons. A request sent from the
+page after that (XMLHttpRequest::send -> RenderFrameImpl::WillSendRequest ->
+GetContentClient()->renderer()) used the freed client: on CoreELEC Cobalt
+crashed with SIGSEGV at every exit and wrote a core dump of several hundred
+MB. Like the thread, these objects now live until the process ends.
+---
+ cobalt/app/app_event_runner.cc | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/cobalt/app/app_event_runner.cc b/cobalt/app/app_event_runner.cc
+index 32b93f99db2..0f822995fcf 100644
+--- a/cobalt/app/app_event_runner.cc
++++ b/cobalt/app/app_event_runner.cc
+@@ -20,6 +20,7 @@
+ #include <optional>
+ #include <sstream>
+ #include <string>
++#include <tuple>
+ #include <utility>
+ #include <vector>
+ 
+@@ -174,8 +175,19 @@ class AppEventRunnerImpl : public AppEventRunner,
+ 
+     // Destroy only after main_runner_/ContentMainRunnerImpl is shutdown
+     // as the delegate is used internally.
++#if BUILDFLAG(IS_STARBOARD)
++    // On Starboard the in-process renderer thread is never joined (see
++    // ~RenderProcessHostImpl): it can still run page tasks, such as a request
++    // sent from an unload handler, through the content clients this delegate
++    // owns and the singletons the AtExitManager destroys. Freeing them made
++    // that thread crash at every exit, so they live as long as the thread,
++    // until the process ends.
++    std::ignore = content_main_delegate_.release();
++    std::ignore = exit_manager_.release();
++#else
+     content_main_delegate_.reset();
+     exit_manager_.reset();
++#endif
+ 
+ #if BUILDFLAG(IS_STARBOARD)
+     platform_event_source_.reset();
+-- 
+2.47.3
+
