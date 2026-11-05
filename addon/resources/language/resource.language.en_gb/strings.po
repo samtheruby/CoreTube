@@ -1,5 +1,5 @@
 # Kodi Media Center language file
-# Addon Name: TizenTube
+# Addon Name: CoreTube
 # Addon id: browser.tizentube
 msgid ""
 msgstr ""
@@ -16,7 +16,7 @@ msgid "Maximum video resolution"
 msgstr ""
 
 msgctxt "#30002"
-msgid "YouTube offers videos up to this resolution. Auto uses the largest of the TV's resolution when TizenTube starts and the display modes for auto frame rate."
+msgid "YouTube offers videos up to this resolution. Auto uses the largest of the TV's resolution when CoreTube starts and the display modes for auto frame rate."
 msgstr ""
 
 msgctxt "#30003"
@@ -48,7 +48,7 @@ msgid "Display modes to switch to"
 msgstr ""
 
 msgctxt "#30012"
-msgid "When auto frame rate is on in TizenTube's settings, the TV switches to the refresh rate of the video, and to its resolution when one of these modes has it. Otherwise it keeps the current resolution."
+msgid "When auto frame rate is on in CoreTube's settings, the TV switches to the refresh rate of the video, and to its resolution when one of these modes has it. Otherwise it keeps the current resolution."
 msgstr ""
 
 msgctxt "#30013"
@@ -64,7 +64,7 @@ msgid "Custom display modes"
 msgstr ""
 
 msgctxt "#30016"
-msgid "Display modes TizenTube may switch to, such as 2160p24hz. 24, 30 and 60 Hz modes also cover 23.976, 29.97 and 59.94 Hz."
+msgid "Display modes CoreTube may switch to, such as 2160p24hz. 24, 30 and 60 Hz modes also cover 23.976, 29.97 and 59.94 Hz."
 msgstr ""
 
 msgctxt "#30017"

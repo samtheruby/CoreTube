@@ -1,6 +1,6 @@
 # CoreTube
 
-CoreTube builds TizenTube, the YouTube TV app, as a Kodi add-on for CoreELEC boxes with Amlogic chips. It makes one add-on zip for each kind of CoreELEC:
+CoreTube is a YouTube TV app based on TizenTube, built as a Kodi add-on for CoreELEC boxes with Amlogic chips. It makes one add-on zip for each kind of CoreELEC:
 
 | Box | CoreELEC | `--arch` |
 |---|---|---|
@@ -34,17 +34,17 @@ The CoreELEC build folder may already hold other CoreELEC work. CoreTube adds it
 
 ## Install
 
-In Kodi, open **Add-ons**, choose **Install from zip file**, and pick the zip. Then open TizenTube from **Add-ons**. Kodi comes back when you exit TizenTube.
+In Kodi, open **Add-ons**, choose **Install from zip file**, and pick the zip. Then open CoreTube from **Add-ons**. Kodi comes back when you exit CoreTube. The add-on keeps its `browser.tizentube` ID so existing installs retain their settings.
 
 Auto frame rate changes the TV's display mode only for fullscreen videos. Preview cards do not trigger mode changes. Like Kodi, it switches to the video's resolution when Kodi's whitelist has a mode at that resolution and a refresh rate that fits the video. Otherwise it keeps the current resolution and changes only the refresh rate. The video's resolution is the best quality YouTube offers for it. YouTube can offer qualities up to the largest whitelisted resolution, so a 4K video on a TV set to 1080p can switch it to 2160p.
 
-TizenTube tells YouTube it is a Fire TV Cube, because YouTube buffers much better for it. To send Cobalt's own user agent instead, put `export TIZENTUBE_USER_AGENT=''` in the add-on's `env` file (in Kodi's `userdata/addon_data/browser.tizentube` folder).
+CoreTube tells YouTube it is a Fire TV Cube, because YouTube buffers much better for it. To send Cobalt's own user agent instead, put `export TIZENTUBE_USER_AGENT=''` in the add-on's `env` file (in Kodi's `userdata/addon_data/browser.tizentube` folder).
 
 After a display mode switch, the video waits before it plays, as in Kodi. The wait is Kodi's **Delay after change of refresh rate** (**Settings** > **System** > **Display**), and at least 1 second, while the TV's picture is off for the switch. TizenTube's own **Auto frame rate pause duration** option has no effect.
 
 Video previews on the home screen are always off: they can make the screen flash white for a moment as they start, and the cause is not known yet. TizenTube's **Video previews** option has no effect.
 
-Update TizenTube through Kodi: install the newer zip the same way. TizenTube's own updater is off; its **Check for updates** button only says that Kodi handles updates.
+Update CoreTube through Kodi: install the newer zip the same way. TizenTube's own updater is off; its **Check for updates** button only says that Kodi handles updates.
 
 ## Tests
 
