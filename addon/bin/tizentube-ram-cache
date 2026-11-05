@@ -1,0 +1,39 @@
+#!/bin/sh
+
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026-present Team CoreELEC (https://coreelec.org)
+
+# tizentube-ram-cache HOME RAM: keep the caches Cobalt can rebuild in RAM.
+# The HTTP cache, the JavaScript code cache and the GPU shader caches are
+# written all session and flushed when Cobalt exits, which wears the eMMC and
+# slows exiting. Each becomes a link to the same folder under RAM (/run, kept
+# until a reboot), so later starts still find them. Cookies, sign-in, storage
+# and TizenTube's settings stay in HOME.
+set -eu
+home=${1:?usage: tizentube-ram-cache HOME RAM}
+ram=${2:?usage: tizentube-ram-cache HOME RAM}
+# Cobalt names each site's folder by its base64 URL; this is https://www.youtube.com/tv,
+# so YouTube's caches are in RAM from the very first start.
+youtube=aHR0cHM6Ly93d3cueW91dHViZS5jb20vdHY=
+
+in_ram() {
+  dir=$home/$1 target=$ram/$1
+  mkdir -p "$target"
+  [ -L "$dir" ] && [ "$(readlink "$dir")" = "$target" ] && return
+  rm -rf "$dir"  # an old cache on the eMMC: Cobalt rebuilds it
+  mkdir -p "$(dirname "$dir")"
+  ln -s "$target" "$dir"
+}
+
+mkdir -p "$home/.cache/cobalt/$youtube" "$home/.cobalt_files/$youtube"
+for site in "$home"/.cache/cobalt/*/; do
+  site=$(basename "$site")
+  in_ram ".cache/cobalt/$site/Cache"
+  in_ram ".cache/cobalt/$site/Code Cache"
+done
+for site in "$home"/.cobalt_files/*/; do
+  site=$(basename "$site")
+  for cache in GPUCache DawnGraphiteCache DawnWebGPUCache; do
+    in_ram ".cobalt_files/$site/$cache"
+  done
+done
