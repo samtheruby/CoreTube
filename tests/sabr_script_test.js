@@ -170,33 +170,62 @@ async function userWins() {
   assert.strictEqual(w.paused, false, 'resumes after 60 s at most');
 }
 
-// Home screen previews are off unless the add-on turns them on
-// (__coretubeVideoPreviews): TizenTube's option and YouTube's flag follow it.
-async function videoPreviews() {
-  const flags = () => new Map([['ENABLE_PREVIEWS_WITH_SOUND', true]]);
-  const config = '{"enableAdBlock":true,"enablePreviews":true}';
-
-  const off = page({ localStorage: { 'ytaf-configuration': config } });
-  assert.deepStrictEqual(JSON.parse(off.ctx.localStorage['ytaf-configuration']),
-    { enableAdBlock: true, enablePreviews: false }, 'off by default; other options kept');
-  const yt = flags();
-  off.ctx._yttv = { a: {}, b: yt };  // YouTube's settings appear later
-  off.runTimeouts();
-  assert.strictEqual(yt.get('ENABLE_PREVIEWS_WITH_SOUND'), false, "YouTube's flag off");
-
-  const on = page({ __coretubeVideoPreviews: true, _yttv: { b: flags() } });
-  assert.strictEqual(JSON.parse(on.ctx.localStorage['ytaf-configuration']).enablePreviews, true,
-    'on when the add-on turns them on, with no stored options yet');
-  assert.strictEqual(on.ctx._yttv.b.get('ENABLE_PREVIEWS_WITH_SOUND'), true);
-
+// TizenTube's options CoreTube replaces are set at each start, other options kept:
+// previews, updater and TizenTube's own auto frame rate pause off.
+async function tizentubeOptions() {
+  const config = '{"enableAdBlock":true,"enablePreviews":true,"enableUpdater":true,"autoFrameRatePauseVideoFor":2000}';
+  const p = page({ localStorage: { 'ytaf-configuration': config } });
+  assert.deepStrictEqual(JSON.parse(p.ctx.localStorage['ytaf-configuration']),
+    { enableAdBlock: true, enablePreviews: false, enableUpdater: false, autoFrameRatePauseVideoFor: 0 });
+  const fresh = page();
+  assert.deepStrictEqual(JSON.parse(fresh.ctx.localStorage['ytaf-configuration']),
+    { enablePreviews: false, enableUpdater: false, autoFrameRatePauseVideoFor: 0 }, 'no stored options yet');
   const broken = page({ localStorage: { 'ytaf-configuration': '{oops' } });
   assert.strictEqual(broken.ctx.localStorage['ytaf-configuration'], '{oops', 'unreadable options left alone');
-  assert.ok(broken.logs.some((l) => l.includes('cannot set the video previews option')));
+  assert.ok(broken.logs.some((l) => l.includes("cannot set TizenTube's options")));
+}
+
+// YouTube's preview flag stays off, even when TizenTube sets it again (its menu).
+async function previewsLockedOff() {
+  const p = page();
+  const flags = new Map([['ENABLE_PREVIEWS_WITH_SOUND', true], ['OTHER', 1]]);
+  p.ctx._yttv = { a: {}, b: flags };  // YouTube's settings appear later
+  p.runTimeouts();
+  assert.strictEqual(flags.get('ENABLE_PREVIEWS_WITH_SOUND'), false);
+  flags.set('ENABLE_PREVIEWS_WITH_SOUND', true);  // TizenTube applying its option
+  assert.strictEqual(flags.get('ENABLE_PREVIEWS_WITH_SOUND'), false, 'locked off');
+  flags.set('OTHER', 2);
+  assert.strictEqual(flags.get('OTHER'), 2, 'other flags still change');
 
   const never = page();  // YouTube's settings never appear: stop looking after a minute
   never.t = 61000;
   never.runTimeouts();
   assert.strictEqual(never.timeouts.length, 0);
+  assert.ok(never.logs.some((l) => l.includes('previews not locked off')));
+}
+
+// "Check for updates": no request to GitHub, no answer (so no TizenTube message),
+// a toast that Kodi handles updates. Other requests go through.
+async function updatesFromKodi() {
+  const commands = [];
+  const p = page();
+  p.ctx._yttv = { a: { instance: { resolveCommand: (c) => commands.push(c) } } };
+  let settled = false;
+  p.ctx.fetch('https://api.github.com/repos/reisxd/TizenTubeCobalt/releases/latest')
+    .then(() => { settled = true; }, () => { settled = true; });
+  await settle();
+  assert.strictEqual(settled, false, 'never answers');
+  assert.strictEqual(p.downloads.length, 0, 'never sent');
+  const toast = commands[0].openPopupAction;
+  assert.strictEqual(toast.popupType, 'TOAST');
+  assert.strictEqual(toast.popup.overlayToastRenderer.title.simpleText, 'Updates are handled by Kodi');
+  p.ctx.fetch('https://www.youtube.com/youtubei/v1/next');
+  assert.strictEqual(p.downloads.length, 1, 'other requests go through');
+
+  const noHandler = page();  // YouTube's command handler missing: logged, still no request
+  noHandler.ctx.fetch('https://api.github.com/repos/reisxd/TizenTubeCobalt/releases/latest');
+  assert.strictEqual(noHandler.downloads.length, 0);
+  assert.ok(noHandler.logs.some((l) => l.includes('cannot show a toast')));
 }
 
 // The keep-alive and the stall gate act only on the watch page, never on a preview,
@@ -259,6 +288,21 @@ async function frameRateCarriesVideoHeight() {
   assert.deepStrictEqual(calls.pop(), [tizentube, 24, 0], 'a broken player: rate only');
 
   page();  // no h5vcc.tizentube (not Cobalt): nothing to wrap, no error
+
+  // TizenTube pauses just before SetFrameRate when its pause option is set: undone
+  // at once, as Cobalt holds playback itself. A pause in an earlier task is the user's.
+  const v = new p.ctx.HTMLVideoElement('v');
+  v.pause();
+  tizentube.SetFrameRate(24);
+  assert.strictEqual(v.paused, false, "TizenTube's pause undone");
+  v.pause();
+  await settle();
+  tizentube.SetFrameRate(24);
+  assert.strictEqual(v.paused, true, 'an earlier pause stays');
+  v.play();
+  v.pause();
+  tizentube.SetFrameRate(0);
+  assert.strictEqual(v.paused, true, 'no frame rate: nothing to undo');
 }
 
 async function onlyOnYouTube() {
@@ -269,7 +313,7 @@ async function onlyOnYouTube() {
 }
 
 (async () => {
-  for (const t of [keepAlive, abortsThatGoThrough, stallGate, userWins, videoPreviews, watchPageOnly, frameRateCarriesVideoHeight, onlyOnYouTube]) {
+  for (const t of [keepAlive, abortsThatGoThrough, stallGate, userWins, tizentubeOptions, previewsLockedOff, updatesFromKodi, watchPageOnly, frameRateCarriesVideoHeight, onlyOnYouTube]) {
     await t();
     console.log(t.name + ': ok');
   }

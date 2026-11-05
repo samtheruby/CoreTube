@@ -1,0 +1,497 @@
+From 5f5d3588bd9e5bed5acf4931e1fa98bc540800bd Mon Sep 17 00:00:00 2001
+From: samtheruby <peasea1012@gmail.com>
+Date: Thu, 5 Nov 2026 21:51:43 +0000
+Subject: [PATCH] feat(coreelec): Kodi's pause after a mode switch; no previews
+ or updater
+
+After an auto frame rate mode switch, playback now waits as Kodi's "Delay
+after change of refresh rate" makes it: only when the mode really changed,
+timed from the switch, for TIZENTUBE_SWITCH_DELAY_MS (Kodi's delay, from the
+add-on) and never shorter than the 1 s HDMI mute, so nothing plays unseen.
+Players hold their pipeline paused (a mode switch tells them through a hold
+listener) and play on when the hold ends.
+
+TizenTube itself still loads from its CDN, so its upgrades keep coming. The
+page script sets the options CoreTube replaces at each start, before
+TizenTube reads them: previews, the updater and TizenTube's own auto frame
+rate pause are off. YouTube's preview flag is locked off, since TizenTube's
+menu sets it again when an option changes. "Check for updates" never reaches
+GitHub; a toast says Kodi handles updates. A pause TizenTube makes just
+before SetFrameRate (its option set again in its menu) is undone at once.
+
+Previews can no longer be turned on, so the TIZENTUBE_VIDEO_PREVIEWS switch
+the shell passed to the page is gone.
+---
+ cobalt/shell/browser/shell.cc                 | 12 +--
+ .../coretube_sabr.js                          | 87 ++++++++++++++----
+ .../coreelec/tests/coreelec_display_test.cc   | 21 +++++
+ .../starboard/rdk/shared/coreelec_display.cc  | 90 +++++++++++++++++--
+ .../starboard/rdk/shared/coreelec_display.h   | 17 ++++
+ .../rdk/shared/player/player_internal.cc      | 45 ++++++++++
+ 6 files changed, 239 insertions(+), 33 deletions(-)
+
+diff --git a/cobalt/shell/browser/shell.cc b/cobalt/shell/browser/shell.cc
+index dec869250dd..050cea5b2b8 100644
+--- a/cobalt/shell/browser/shell.cc
++++ b/cobalt/shell/browser/shell.cc
+@@ -25,7 +25,6 @@
+ #include <vector>
+ 
+ #include "base/command_line.h"
+-#include "base/environment.h"
+ #include "base/feature_list.h"
+ #include "base/functional/callback_helpers.h"
+ #include "base/location.h"
+@@ -632,16 +631,6 @@ void Shell::DidStopLoading() {
+ }
+ 
+ void Shell::RegisterInjectedJavaScript() {
+-  const std::vector<std::string> allowed_origins({"*"});
+-  // CoreTube's add-on setting for home screen video previews, for
+-  // coretube_sabr.js: TIZENTUBE_VIDEO_PREVIEWS=1 turns them on.
+-  const bool previews = base::Environment::Create()->GetVar(
+-                            "TIZENTUBE_VIDEO_PREVIEWS") == "1";
+-  js_communication_host_->AddDocumentStartJavaScript(
+-      previews ? u"window.__coretubeVideoPreviews = true;"
+-               : u"window.__coretubeVideoPreviews = false;",
+-      allowed_origins);
+-
+   // Get the embedded header resource
+   GeneratedResourceMap resource_map;
+   CobaltJavaScriptPolyfill::GenerateMap(resource_map);
+@@ -653,6 +642,7 @@ void Shell::RegisterInjectedJavaScript() {
+ 
+     // Inject a script at document start for all origins
+     const std::u16string script(base::UTF8ToUTF16(js));
++    const std::vector<std::string> allowed_origins({"*"});
+     auto result = js_communication_host_->AddDocumentStartJavaScript(
+         script, allowed_origins);
+ 
+diff --git a/cobalt/shell/embedded_resources/cobalt_java_script_polyfill/coretube_sabr.js b/cobalt/shell/embedded_resources/cobalt_java_script_polyfill/coretube_sabr.js
+index 635dbfbd8f1..9bcefada843 100644
+--- a/cobalt/shell/embedded_resources/cobalt_java_script_polyfill/coretube_sabr.js
++++ b/cobalt/shell/embedded_resources/cobalt_java_script_polyfill/coretube_sabr.js
+@@ -10,8 +10,13 @@
+ //   kept aborting each slow download and throwing its data away.
+ // - After a stall, playback resumes only with 5 s buffered (2.5 s within 5 s of
+ //   a seek), instead of playing a second and stalling again.
+-// Home screen video previews are off unless the add-on turns them on: a preview
+-// starting can flash the screen white for a moment (cause unknown).
++// TizenTube's options that CoreTube replaces, set at each start (TizenTube itself
++// loads from its CDN, unchanged):
++// - Home screen video previews stay off: a preview starting can flash the screen
++//   white for a moment (cause unknown).
++// - No updater: Kodi updates the add-on. "Check for updates" says so.
++// - No TizenTube pause for auto frame rate: Cobalt holds playback after a mode
++//   switch itself, as Kodi's "Delay after change of refresh rate" does.
+ // TizenTube's auto frame rate also tells Cobalt the video's best resolution.
+ (function () {
+   'use strict';
+@@ -33,29 +38,63 @@
+   var lastSeek = -1e9;
+   document.addEventListener('seeking', function () { lastSeek = now(); }, true);
+ 
+-  // --- Home screen previews: off unless the add-on turns them on -----------
+-  // The add-on's setting arrives as __coretubeVideoPreviews (true: on). It sets
+-  // TizenTube's "Video previews" option, which TizenTube applies to YouTube's
+-  // preview flag, and that flag itself in case TizenTube does not load.
+-  var previews = window.__coretubeVideoPreviews === true;
++  // --- TizenTube's options CoreTube replaces --------------------------------
++  // TizenTube reads its stored options once, as it loads (after this script).
++  var OPTIONS = { enablePreviews: false, enableUpdater: false, autoFrameRatePauseVideoFor: 0 };
+   try {
+     var config = JSON.parse(localStorage['ytaf-configuration'] || '{}');
+-    if (config.enablePreviews !== previews) {
+-      config.enablePreviews = previews;
+-      localStorage['ytaf-configuration'] = JSON.stringify(config);
+-    }
++    var changed = false;
++    Object.keys(OPTIONS).forEach(function (key) {
++      if (config[key] !== OPTIONS[key]) {
++        config[key] = OPTIONS[key];
++        changed = true;
++      }
++    });
++    if (changed) localStorage['ytaf-configuration'] = JSON.stringify(config);
+   } catch (e) {
+-    log('cannot set the video previews option: ' + e);
++    log("cannot set TizenTube's options: " + e);
+   }
++
++  // --- Home screen previews: always off --------------------------------------
++  // TizenTube sets YouTube's preview flag (ENABLE_PREVIEWS_WITH_SOUND, which starts
++  // and stops previews) from its option at load and again whenever an option
++  // changes, so its menu could turn previews on: that flag stays off.
+   var flagWaitStart = now();
+-  var setPreviewFlag = function () {
++  var lockPreviewFlag = function () {
+     var flags = window._yttv && Object.values(window._yttv).find(function (v) {
+       return v instanceof Map && v.has('ENABLE_PREVIEWS_WITH_SOUND');
+     });
+-    if (flags) flags.set('ENABLE_PREVIEWS_WITH_SOUND', previews);
+-    else if (now() - flagWaitStart < FLAG_WAIT_MS) setTimeout(setPreviewFlag, 250);
++    if (flags) {
++      var origSet = flags.set;
++      flags.set = function (key, value) {
++        return origSet.call(this, key, key === 'ENABLE_PREVIEWS_WITH_SOUND' ? false : value);
++      };
++      flags.set('ENABLE_PREVIEWS_WITH_SOUND', false);
++    } else if (now() - flagWaitStart < FLAG_WAIT_MS) {
++      setTimeout(lockPreviewFlag, 250);
++    } else {
++      log("YouTube's preview flag did not appear: previews not locked off");
++    }
++  };
++  lockPreviewFlag();
++
++  // --- Updater: Kodi's ---------------------------------------------------------
++  // TizenTube's "Check for updates" asks GitHub for a TizenTube Cobalt (Android)
++  // release. That request never goes out and never answers, so TizenTube shows
++  // nothing of its own; a toast says where updates come from.
++  var UPDATE_CHECK_URL = 'https://api.github.com/repos/reisxd/TizenTubeCobalt/releases';
++  var showToast = function (title, subtitle) {
++    var yttv = window._yttv || {};
++    for (var key in yttv) {
++      var instance = yttv[key] && yttv[key].instance;
++      if (instance && typeof instance.resolveCommand === 'function') {
++        instance.resolveCommand({ openPopupAction: { popupType: 'TOAST', popup: {
++          overlayToastRenderer: { title: { simpleText: title }, subtitle: { simpleText: subtitle } } } } });
++        return;
++      }
++    }
++    log('cannot show a toast: YouTube\'s command handler not found');
+   };
+-  setPreviewFlag();
+ 
+   // --- Auto frame rate: the video's resolution too --------------------------
+   // TizenTube passes only the frame rate. Add the height of the best quality
+@@ -73,11 +112,19 @@
+       return 0;
+     }
+   };
++  // TizenTube pauses the video just before SetFrameRate when its pause option is
++  // set (in its menu, since the last start). Cobalt holds playback itself, and
++  // only when the mode switches: undo that pause at once.
++  var pausedJustNow = null;  // the video paused in this task, if any
+   var tizentube = window.h5vcc && window.h5vcc.tizentube;
+   var tizentubeApi = tizentube && Object.getPrototypeOf(tizentube);
+   if (tizentubeApi && typeof tizentubeApi.SetFrameRate === 'function') {
+     var origSetFrameRate = tizentubeApi.SetFrameRate;
+     tizentubeApi.SetFrameRate = function (frameRate) {
++      if (frameRate > 0 && pausedJustNow) {
++        log("undid TizenTube's auto frame rate pause: Cobalt holds playback after a mode switch");
++        origPlay.call(pausedJustNow).catch(function () {});
++      }
+       return origSetFrameRate.call(this, frameRate, frameRate > 0 ? bestVideoHeight() : 0);
+     };
+   }
+@@ -87,6 +134,11 @@
+   var origFetch = window.fetch;
+   window.fetch = function (input, init) {
+     var url = typeof input === 'string' ? input : input && input.url;
++    if (typeof url === 'string' && url.indexOf(UPDATE_CHECK_URL) === 0) {
++      log('update check skipped: Kodi updates CoreTube');
++      showToast('Updates are handled by Kodi', "Update TizenTube in Kodi's add-on manager");
++      return new Promise(function () {});
++    }
+     var res = origFetch.apply(this, arguments);
+     var signal = (init && init.signal) || (input instanceof Request ? input.signal : null);
+     if (signal && typeof url === 'string' && url.indexOf('videoplayback') >= 0) {
+@@ -156,6 +208,9 @@
+   // A pause or play from the page (the user) ends the hold without resuming.
+   HTMLMediaElement.prototype.pause = function () {
+     if (gate && gate.video === this) endGate(false);
++    var video = this;
++    pausedJustNow = video;
++    Promise.resolve().then(function () { if (pausedJustNow === video) pausedJustNow = null; });
+     return origPause.apply(this, arguments);
+   };
+   HTMLMediaElement.prototype.play = function () {
+diff --git a/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/tests/coreelec_display_test.cc b/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/tests/coreelec_display_test.cc
+index a27888079db..85833b8edd3 100644
+--- a/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/tests/coreelec_display_test.cc
++++ b/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/tests/coreelec_display_test.cc
+@@ -236,6 +236,27 @@ int main() {
+   assert(x == 0 && y == 0 && w == 3840 && h == 2160);
+   SetModeSetter(nullptr);
+ 
++  // After a mode switch playback waits, as with Kodi's "Delay after change of
++  // refresh rate" (TIZENTUBE_SWITCH_DELAY_MS), and at least while HDMI is muted.
++  using std::chrono::milliseconds;
++  assert(SwitchHold(nullptr) == milliseconds(1000));   // no delay: the mute
++  assert(SwitchHold("2500") == milliseconds(2500));
++  assert(SwitchHold("500") == milliseconds(1000));
++  assert(SwitchHold("junk") == milliseconds(1000) && SwitchHold("-300") == milliseconds(1000));
++  assert(SwitchHold("2500ms") == milliseconds(1000));  // not a number of ms
++  assert(SwitchHold("999999") == milliseconds(20000)); // Kodi's longest delay
++  int told = 0;
++  SetPlaybackHoldListener([&told] { told++; });
++  assert(!PlaybackHeld(t0));
++  HoldPlayback(t0 + 2500ms);
++  assert(told == 1 && PlaybackHeld(t0) && PlaybackHeld(t0 + 2499ms));
++  assert(!PlaybackHeld(t0 + 2500ms));
++  assert(PlaybackHoldEnd() == t0 + 2500ms);
++  assert(EndPlaybackHold(t0 + 2s) == false && told == 1);  // not due
++  assert(EndPlaybackHold(t0 + 2500ms) && told == 2 && !PlaybackHoldEnd());
++  assert(!EndPlaybackHold(t0 + 3s) && told == 2);          // nothing left
++  SetPlaybackHoldListener(nullptr);
++
+   // The mode for a WxH picture after the display changed (hotplug, another TV).
+   std::vector<OutputMode> outputs = {
+       {"2160p60hz", 3840, 2160, false, 60}, {"1080i60hz", 1920, 1080, true, 60},
+diff --git a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.cc b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.cc
+index 0905f27f442..8c371774d33 100644
+--- a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.cc
++++ b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.cc
+@@ -130,22 +130,31 @@ void Switch(const ModeSwitch& target) {
+     setter = g_setter;
+   }
+   g_mutes += WriteFile(kVideoMutePath, "1");
++  bool switched = false;
+   if (setter) {
+     // The DRM window reports the new mode once it shows it (DisplayModeChanged).
+-    if (!setter(target)) {
++    switched = setter(target);
++    if (!switched) {
+       SB_LOG(WARNING) << "Auto frame rate: the display cannot switch to " << target.name;
+     }
+   } else {
+     auto before = ParseMode(ReadFile(kModePath));
+-    if (WriteFile(kFracRatePath, target.fractional ? "1" : "0") &&
+-        WriteFile(kModePath, target.name + target.suffix) && before &&
++    switched = WriteFile(kFracRatePath, target.fractional ? "1" : "0") &&
++               WriteFile(kModePath, target.name + target.suffix);
++    if (switched && before &&
+         (before->width != target.width || before->height != target.height)) {
+       ScaleFramebufferTo(target.width, target.height);
+       DisplayModeChanged(target.width, target.height);
+     }
+   }
+   g_mutes += WriteFile(kVideoMutePath, "1");
+-  g_unmute_at = AutoFrameRate::Clock::now() + kSwitchMute;
++  const auto now = AutoFrameRate::Clock::now();
++  g_unmute_at = now + kSwitchMute;
++  if (switched) {
++    const auto hold = SwitchHold(getenv("TIZENTUBE_SWITCH_DELAY_MS"));
++    SB_LOG(INFO) << "Auto frame rate: playback waits " << hold.count() << " ms";
++    HoldPlayback(now + hold);
++  }
+ }
+ 
+ class FrameRateThread {
+@@ -173,8 +182,10 @@ class FrameRateThread {
+     std::unique_lock<std::mutex> lock(g_frame_rate_mutex);
+     while (!stop_) {
+       auto next = g_frame_rate.restore_time();
+-      if (g_unmute_at && (!next || *g_unmute_at < *next)) {
+-        next = g_unmute_at;
++      for (auto at : {g_unmute_at, PlaybackHoldEnd()}) {
++        if (at && (!next || *at < *next)) {
++          next = at;
++        }
+       }
+       if (!next) {
+         g_frame_rate_wake.wait(lock);
+@@ -185,6 +196,7 @@ class FrameRateThread {
+       if (g_unmute_at && now >= *g_unmute_at) {
+         Unmute();
+       }
++      EndPlaybackHold(now);
+       auto back = g_frame_rate.Restore(ReadFile(kModePath),
+                                        ReadFile(kFracRatePath) == "1", now);
+       if (back) {
+@@ -588,6 +600,72 @@ void SetModeSetter(ModeSetter setter) {
+   g_setter = std::move(setter);
+ }
+ 
++namespace {
++std::mutex g_hold_mutex;
++std::optional<AutoFrameRate::Clock::time_point> g_hold_until;
++std::function<void()> g_hold_listener;
++
++void TellHoldListener() {
++  std::function<void()> listener;
++  {
++    std::lock_guard<std::mutex> lock(g_hold_mutex);
++    listener = g_hold_listener;
++  }
++  if (listener) {
++    listener();
++  }
++}
++}  // namespace
++
++std::chrono::milliseconds SwitchHold(const char* delay_ms) {
++  constexpr long kLongestMs = 20000;
++  long delay = 0;
++  if (delay_ms) {
++    char* end = nullptr;
++    const long value = strtol(delay_ms, &end, 10);
++    if (end != delay_ms && *end == '\0' && value > 0) {
++      delay = std::min(value, kLongestMs);
++    }
++  }
++  return std::max(std::chrono::milliseconds(delay),
++                  std::chrono::duration_cast<std::chrono::milliseconds>(kSwitchMute));
++}
++
++void HoldPlayback(AutoFrameRate::Clock::time_point until) {
++  {
++    std::lock_guard<std::mutex> lock(g_hold_mutex);
++    g_hold_until = until;
++  }
++  TellHoldListener();
++}
++
++bool EndPlaybackHold(AutoFrameRate::Clock::time_point now) {
++  {
++    std::lock_guard<std::mutex> lock(g_hold_mutex);
++    if (!g_hold_until || now < *g_hold_until) {
++      return false;
++    }
++    g_hold_until.reset();
++  }
++  TellHoldListener();
++  return true;
++}
++
++std::optional<AutoFrameRate::Clock::time_point> PlaybackHoldEnd() {
++  std::lock_guard<std::mutex> lock(g_hold_mutex);
++  return g_hold_until;
++}
++
++bool PlaybackHeld(AutoFrameRate::Clock::time_point now) {
++  std::lock_guard<std::mutex> lock(g_hold_mutex);
++  return g_hold_until && now < *g_hold_until;
++}
++
++void SetPlaybackHoldListener(std::function<void()> listener) {
++  std::lock_guard<std::mutex> lock(g_hold_mutex);
++  g_hold_listener = std::move(listener);
++}
++
+ namespace {
+ std::mutex g_output_mutex;
+ int g_output_width = 0;  // the mode on screen, once DisplayModeChanged says
+diff --git a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.h b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.h
+index 2bd60e6cb42..0bb5ea17bce 100644
+--- a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.h
++++ b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.h
+@@ -155,6 +155,23 @@ bool FillsWindow(int x, int y, int width, int height);
+ using ModeSetter = std::function<bool(const ModeSwitch&)>;
+ void SetModeSetter(ModeSetter setter);
+ 
++// Playback after a mode switch, as with Kodi's "Delay after change of refresh
++// rate": players hold their video for SwitchHold() after each switch, so the TV
++// has settled and nothing plays unseen. |delay_ms| is the add-on's
++// TIZENTUBE_SWITCH_DELAY_MS (Kodi's delay); the hold lasts at least while HDMI
++// is muted after the switch, and at most Kodi's longest delay (20 s).
++std::chrono::milliseconds SwitchHold(const char* delay_ms);
++// Holds playback until |until|, and tells the listener.
++void HoldPlayback(AutoFrameRate::Clock::time_point until);
++// Ends the hold once |now| reaches its end, and tells the listener. True when
++// it ended.
++bool EndPlaybackHold(AutoFrameRate::Clock::time_point now);
++std::optional<AutoFrameRate::Clock::time_point> PlaybackHoldEnd();
++bool PlaybackHeld(AutoFrameRate::Clock::time_point now = AutoFrameRate::Clock::now());
++// Told when a hold starts or ends: players pause, or play on. Any thread; it
++// must not block.
++void SetPlaybackHoldListener(std::function<void()> listener);
++
+ // The display now shows a |width|x|height| mode (a switch, or another TV). It
+ // bumps DisplayGeneration(): players then place their video again, as its
+ // rectangle on the screen depends on the mode.
+diff --git a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/player/player_internal.cc b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/player/player_internal.cc
+index 1a9c4360c22..48c697fa63b 100644
+--- a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/player/player_internal.cc
++++ b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/player/player_internal.cc
+@@ -1425,6 +1425,8 @@ class PlayerImpl : public Player {
+   bool IsValid() const { return playback_thread_.joinable(); }
+   bool HasMaxVideoCaps() const { return max_video_capabilities_.IsValid(); }
+   void AudioConfigurationChanged();
++  // COREELEC: a display mode switch started or ended its playback hold.
++  void PlaybackHoldChanged();
+ 
+  private:
+   // Hands |rect| to the video sink. Called with bounds_mutex_ held.
+@@ -1708,6 +1710,7 @@ class PlayerImpl : public Player {
+   bool enforce_sw_decoders_ { false };
+   bool audio_passthrough_ { false };  // COREELEC: audio goes out as a bitstream
+   std::atomic<bool> on_screen_ { false };  // COREELEC: the video fills the screen
++  std::atomic<bool> held_for_switch_ { false };  // COREELEC: paused by a mode switch
+   // The bounds the sink has, and the display mode they were placed for (COREELEC).
+   std::mutex bounds_mutex_;
+   ::starboard::Rect bounds_;
+@@ -1769,6 +1772,13 @@ struct PlayerRegistry
+       p->AudioConfigurationChanged();
+     }
+   }
++
++  void PlaybackHoldChanged() {
++    std::lock_guard lock(mutex_);
++    for(const auto& p: players_) {
++      p->PlaybackHoldChanged();
++    }
++  }
+ };
+ SB_ONCE_INITIALIZE_FUNCTION(PlayerRegistry, GetPlayerRegistry);
+ 
+@@ -1946,6 +1956,13 @@ PlayerImpl::PlayerImpl(SbPlayer player,
+      SB_NOTREACHED();
+   }
+   GetPlayerRegistry()->Add(this);
++#if defined(COREELEC)
++  static std::once_flag hold_listener;
++  std::call_once(hold_listener, [] {
++    ::third_party::starboard::rdk::shared::coreelec::SetPlaybackHoldListener(
++        [] { GetPlayerRegistry()->PlaybackHoldChanged(); });
++  });
++#endif
+ }
+ 
+ PlayerImpl::~PlayerImpl() {
+@@ -3103,6 +3120,15 @@ bool PlayerImpl::ChangePipelineState(GstState state) {
+     GST_INFO_OBJECT(pipeline_, "Ignore state change due to forced stop");
+     return false;
+   }
++#if defined(COREELEC)
++  // After a display mode switch playback waits (PlaybackHoldChanged plays on).
++  if (state == GST_STATE_PLAYING &&
++      ::third_party::starboard::rdk::shared::coreelec::PlaybackHeld()) {
++    held_for_switch_ = true;
++    GST_INFO_OBJECT(pipeline_, "Playing after the display mode switch settles");
++    state = GST_STATE_PAUSED;
++  }
++#endif
+ 
+   GstState current, pending;
+   current = pending = GST_STATE_VOID_PENDING;
+@@ -3591,6 +3617,25 @@ void PlayerImpl::AddBufferingProbe(GstClockTime target, int ticket) {
+   }
+ }
+ 
++void PlayerImpl::PlaybackHoldChanged() {
++#if defined(COREELEC)
++  DispatchOnWorkerThread(new FunctionTask([this]() {
++    if (::third_party::starboard::rdk::shared::coreelec::PlaybackHeld()) {
++      GstState state = GST_STATE_VOID_PENDING, pending = GST_STATE_VOID_PENDING;
++      gst_element_get_state(pipeline_, &state, &pending, 0);
++      if (state == GST_STATE_PLAYING || pending == GST_STATE_PLAYING) {
++        held_for_switch_ = true;
++        GST_INFO_OBJECT(pipeline_, "Holding playback after a display mode switch");
++        ChangePipelineState(GST_STATE_PAUSED);
++      }
++    } else if (held_for_switch_.exchange(false)) {
++      GST_INFO_OBJECT(pipeline_, "Display mode switch settled: playing on");
++      SchedulePlayingStateUpdate();
++    }
++  }, "Display mode switch hold"));
++#endif
++}
++
+ void PlayerImpl::SchedulePlayingStateUpdate() {
+   if (playing_state_update_source_id_ != 0u)  // already scheduled
+     return;
+-- 
+2.47.3
+

@@ -32,11 +32,21 @@ def read_disp_cap():
     return ''
 
 
-def kodi_whitelist():
+def kodi_setting(setting, default):
   request = {'jsonrpc': '2.0', 'id': 1, 'method': 'Settings.GetSettingValue',
-             'params': {'setting': 'videoscreen.whitelist'}}
+             'params': {'setting': setting}}
   reply = json.loads(xbmc.executeJSONRPC(json.dumps(request)))
-  return reply.get('result', {}).get('value', [])
+  return reply.get('result', {}).get('value', default)
+
+
+def kodi_whitelist():
+  return kodi_setting('videoscreen.whitelist', [])
+
+
+def switch_delay_ms():
+  """Kodi's "Delay after change of refresh rate" (tenths of a second) in ms, for Cobalt."""
+  tenths = kodi_setting('videoscreen.delayrefreshchange', 0)
+  return tenths * 100 if isinstance(tenths, int) and tenths > 0 else 0
 
 
 def allowed_modes():
@@ -66,8 +76,8 @@ def start():
   max_height = addon.getSetting('max_resolution')
   env = {'TIZENTUBE_DISPLAY_MODES': allowed_modes(),
          'TIZENTUBE_MAX_VIDEO_HEIGHT': '' if max_height == 'auto' else max_height,
-         # Off by default: previews can flash the screen white as they start.
-         'TIZENTUBE_VIDEO_PREVIEWS': '1' if addon.getSettingBool('video_previews') else '0',
+         # Playback waits this long after an auto frame rate mode switch, as in Kodi.
+         'TIZENTUBE_SWITCH_DELAY_MS': str(switch_delay_ms()),
          'TIZENTUBE_USER_AGENT': FIRE_TV_USER_AGENT}
   # Cobalt needs the framebuffer, so Kodi stops while it runs. A separate systemd
   # unit keeps Cobalt alive when Kodi stops, and ExecStopPost brings Kodi back

@@ -19,11 +19,6 @@
             <heading>30001</heading>
           </control>
         </setting>
-        <setting id="video_previews" type="boolean" label="30019" help="30020">
-          <level>0</level>
-          <default>false</default>
-          <control type="toggle"/>
-        </setting>
       </group>
       <group id="2" label="30010">
         <setting id="afr_modes" type="string" label="30011" help="30012">

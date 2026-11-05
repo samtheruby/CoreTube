@@ -40,7 +40,11 @@ Auto frame rate changes the TV's display mode only for fullscreen videos. Previe
 
 TizenTube tells YouTube it is a Fire TV Cube, because YouTube buffers much better for it. To send Cobalt's own user agent instead, put `export TIZENTUBE_USER_AGENT=''` in the add-on's `env` file (in Kodi's `userdata/addon_data/browser.tizentube` folder).
 
-Video previews on the home screen are off. To turn them on, open the add-on's settings (**Add-ons** > TizenTube > **Configure**) and switch on **Video previews on the home screen**. Previews can make the screen flash white for a moment as they start; the cause is not known yet.
+After a display mode switch, the video waits before it plays, as in Kodi. The wait is Kodi's **Delay after change of refresh rate** (**Settings** > **System** > **Display**), and at least 1 second, while the TV's picture is off for the switch. TizenTube's own **Auto frame rate pause duration** option has no effect.
+
+Video previews on the home screen are always off: they can make the screen flash white for a moment as they start, and the cause is not known yet. TizenTube's **Video previews** option has no effect.
+
+Update TizenTube through Kodi: install the newer zip the same way. TizenTube's own updater is off; its **Check for updates** button only says that Kodi handles updates.
 
 ## Tests
 
