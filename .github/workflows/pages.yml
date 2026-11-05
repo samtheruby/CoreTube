@@ -1,0 +1,66 @@
+name: Publish Kodi repository
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - repository/**
+      - tools/build_repository.py
+      - tests/test_repository.py
+      - addon/resources/icon.png
+      - .github/workflows/pages.yml
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: read
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository tools
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Test repository builder
+        run: python3 -m unittest discover -s tests -p test_repository.py
+      - name: Download latest stable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: >-
+          gh release download
+          --pattern 'browser.tizentube-*-arm.zip'
+          --pattern 'browser.tizentube-*-aarch64.zip'
+          --pattern SHA256SUMS --dir release-assets
+      - name: Build Kodi repository
+        run: python3 tools/build_repository.py release-assets out/pages
+      - name: Configure Pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d  # v6.0.0
+      - name: Upload site
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9  # v5.0.0
+        with:
+          path: out/pages
+          include-hidden-files: true
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy Kodi repository
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346  # v5.0.1

@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>CoreTube Kodi repository</title>
+    <style>
+      :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+      body { max-width: 44rem; margin: 3rem auto; padding: 0 1.25rem; line-height: 1.6; }
+      a { color: light-dark(#075bb5, #87c5ff); text-underline-offset: .2em; }
+      a:focus-visible { outline: 3px solid currentColor; outline-offset: 4px; }
+      code { overflow-wrap: anywhere; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>CoreTube Kodi repository</h1>
+      <p>YouTube TV for CoreELEC boxes with Amlogic chips. Latest stable version: {{version}}.</p>
+      <p><a href="{{repository_zip}}">Download the CoreTube repository ZIP</a></p>
+      <h2>Install in Kodi</h2>
+      <ol>
+        <li>Open <strong>Settings → File manager → Add source</strong> and enter
+          <code>https://samtheruby.github.io/CoreTube/</code>. Name it <strong>CoreTube</strong>.</li>
+        <li>Open <strong>Add-ons → Install from zip file → CoreTube</strong> and choose the repository ZIP.
+          Enable <strong>Unknown sources</strong> in Kodi's add-on settings if prompted.</li>
+        <li>Choose <strong>Install from repository → CoreTube Repository → Video add-ons → CoreTube</strong>.</li>
+      </ol>
+      <p>Kodi selects the matching package for 32-bit CoreELEC 21 or 64-bit CoreELEC 22.
+        Install only on these supported systems. Leave automatic updates enabled to get new stable releases.</p>
+      <p>Already installed CoreTube from a ZIP? Open its add-on information, choose
+        <strong>Versions</strong>, and select the version from <strong>CoreTube Repository</strong>
+        to receive repository updates. Your settings stay in place.</p>
+      <p><a href="https://github.com/samtheruby/CoreTube/releases/latest">Release notes and direct downloads</a>
+        · <a href="https://github.com/samtheruby/CoreTube">Source code and help</a></p>
+    </main>
+  </body>
+</html>

@@ -34,6 +34,10 @@ The CoreELEC build folder may already hold other CoreELEC work. CoreTube adds it
 
 ## Install
 
+To install through Kodi and receive updates, add `https://samtheruby.github.io/CoreTube/` as a source in **Settings > File manager > Add source**. Open **Add-ons > Install from zip file**, choose that source, and install the repository ZIP. Enable **Unknown sources** in Kodi's add-on settings if prompted. Then choose **Install from repository > CoreTube Repository > Video add-ons > CoreTube**. Kodi selects the matching package for CoreELEC 21 (ARM) or 22 (AArch64); use only these supported systems.
+
+If you already installed CoreTube from a ZIP, open its add-on information, choose **Versions**, and select CoreTube from **CoreTube Repository** to receive repository updates.
+
 In Kodi, open **Add-ons**, choose **Install from zip file**, and pick the zip. Then open CoreTube from **Add-ons**. Kodi comes back when you exit CoreTube. The add-on keeps its `browser.tizentube` ID so existing installs retain their settings.
 
 Auto frame rate changes the TV's display mode only for fullscreen videos. Preview cards do not trigger mode changes. Like Kodi, it switches to the video's resolution when Kodi's whitelist has a mode at that resolution and a refresh rate that fits the video. Otherwise it keeps the current resolution and changes only the refresh rate. The video's resolution is the best quality YouTube offers for it. YouTube can offer qualities up to the largest whitelisted resolution, so a 4K video on a TV set to 1080p can switch it to 2160p.
@@ -53,6 +57,12 @@ Update CoreTube through Kodi: install the newer zip the same way. TizenTube's ow
 ```
 
 Without `--docker`, the tests need Python 3.10 or newer with pytest.
+
+## Repository updates
+
+GitHub Pages publishes the latest stable release automatically when a release is published or the repository setup changes on `main`. Upload both architecture ZIPs and `SHA256SUMS` before publishing each release. The **Publish Kodi repository** GitHub Actions workflow can also be run manually.
+
+To check the repository locally, download those three release assets into a folder and run `python3 tools/build_repository.py ASSET_FOLDER out/pages`. The output folder must not already exist. The builder verifies both checksums and architectures before creating the site.
 
 ## License
 

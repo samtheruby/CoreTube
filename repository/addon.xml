@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<addon id="repository.coretube" name="CoreTube Repository" version="1.0.0" provider-name="CoreTube">
+  <extension point="xbmc.addon.repository">
+    <dir minversion="21.0.0" maxversion="21.999.999">
+      <info>https://samtheruby.github.io/CoreTube/arm/addons.xml</info>
+      <checksum verify="sha256">https://samtheruby.github.io/CoreTube/arm/addons.xml.sha256</checksum>
+      <datadir>https://samtheruby.github.io/CoreTube/arm/</datadir>
+      <hashes>sha256</hashes>
+    </dir>
+    <dir minversion="22.0.0" maxversion="22.999.999">
+      <info>https://samtheruby.github.io/CoreTube/aarch64/addons.xml</info>
+      <checksum verify="sha256">https://samtheruby.github.io/CoreTube/aarch64/addons.xml.sha256</checksum>
+      <datadir>https://samtheruby.github.io/CoreTube/aarch64/</datadir>
+      <hashes>sha256</hashes>
+    </dir>
+  </extension>
+  <extension point="xbmc.addon.metadata">
+    <summary>CoreTube updates for CoreELEC</summary>
+    <description>Install CoreTube on CoreELEC 21 (ARM) or CoreELEC 22 (AArch64). Kodi selects the matching package.</description>
+    <license>BSD-3-Clause</license>
+    <platform>all</platform>
+    <assets>
+      <icon>resources/icon.png</icon>
+    </assets>
+  </extension>
+</addon>
