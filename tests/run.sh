@@ -11,7 +11,7 @@ for t in tests/test_*.sh; do
   sh "$t"
 done
 dirs=""
-for d in addon/tests drm/tools/tests; do
+for d in tests addon/tests drm/tools/tests; do
   [ -d "$d" ] && dirs="$dirs $d"
 done
 if [ -n "$dirs" ]; then
