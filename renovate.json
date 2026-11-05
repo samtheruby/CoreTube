@@ -1,0 +1,12 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "packageRules": [
+    {
+      "description": "Keep Ubuntu bases aligned with CoreELEC 21 (focal) and CoreELEC 22 (noble) build toolchains.",
+      "matchManagers": ["dockerfile"],
+      "matchFileNames": ["docker/ng.Dockerfile", "docker/no.Dockerfile"],
+      "matchPackageNames": ["ubuntu"],
+      "enabled": false
+    }
+  ]
+}
