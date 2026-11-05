@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: BSD-3-Clause
 import hashlib
+import re
 import struct
 import subprocess
 import sys
@@ -86,6 +87,16 @@ class RepositoryTests(unittest.TestCase):
             )
             self.assertIn(
                 f'href="{installer.name}"', (output / "index.html").read_text()
+            )
+            # Kodi HTTPDirectory lists links only when their label matches the filename.
+            links = re.findall(
+                r'<a href="([^"]*)"[^>]*>\s*(.*?)\s*</a>(.+?)(?=<a|</tr|$)',
+                (output / "index.html").read_text(),
+                re.IGNORECASE | re.DOTALL,
+            )
+            self.assertEqual(
+                [href for href, label, _ in links if href == label.strip()],
+                [installer.name],
             )
             with zipfile.ZipFile(installer) as z:
                 manifest = ET.fromstring(z.read("repository.coretube/addon.xml"))
