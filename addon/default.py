@@ -82,7 +82,9 @@ def start():
   # Cobalt needs the framebuffer, so Kodi stops while it runs. A separate systemd
   # unit keeps Cobalt alive when Kodi stops, and ExecStopPost brings Kodi back
   # however Cobalt ends (exit, crash or `systemctl stop tizentube`).
-  result = subprocess.run(['systemd-run', '--unit=tizentube', '--collect',
+  # No core dumps: CoreELEC keeps them, unlimited, and Cobalt's is several hundred
+  # MB, written to the eMMC before Kodi can come back.
+  result = subprocess.run(['systemd-run', '--unit=tizentube', '--collect', '--property=LimitCORE=0',
                            f'--property=ExecStopPost=/bin/sh {os.path.join(addon_dir, "bin", "tizentube-stop")}',
                            '--property=ExecStopPost=/usr/bin/systemctl --no-block start kodi',
                            *[f'--setenv={k}={v}' for k, v in env.items()],

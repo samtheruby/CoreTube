@@ -14,9 +14,9 @@ ADDON = Path(__file__).resolve().parent.parent
 
 
 @pytest.fixture
-def start_env(monkeypatch):
-  """start_env(settings, kodi): the environment default.py gives Cobalt's unit, with these
-  add-on settings and Kodi settings (JSON-RPC Settings.GetSettingValue)."""
+def start_command(monkeypatch):
+  """start_command(settings, kodi): the systemd-run command default.py runs for Cobalt's unit,
+  with these add-on settings and Kodi settings (JSON-RPC Settings.GetSettingValue)."""
   def run(settings, kodi=None):
     addon = types.SimpleNamespace(
         getAddonInfo=lambda key: str(ADDON),
@@ -33,5 +33,14 @@ def start_env(monkeypatch):
     monkeypatch.setattr(subprocess, 'run', lambda args, **kw: calls.append(args) or
                         types.SimpleNamespace(returncode=0, stdout=''))
     runpy.run_path(str(ADDON / 'default.py'))
-    return dict(a[len('--setenv='):].split('=', 1) for a in calls[0] if a.startswith('--setenv='))
+    return calls[0]
+  return run
+
+
+@pytest.fixture
+def start_env(start_command):
+  """start_env(settings, kodi): the environment default.py gives Cobalt's unit."""
+  def run(settings, kodi=None):
+    return dict(a[len('--setenv='):].split('=', 1) for a in start_command(settings, kodi)
+                if a.startswith('--setenv='))
   return run
