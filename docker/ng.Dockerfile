@@ -25,13 +25,16 @@ ENV LANG=en_US.UTF-8 \
     LC_ALL=en_US.UTF-8
 
 # CoreELEC's build dependencies, as its focal container installs them, then
-# CoreTube's: pkg-config and GStreamer/ALSA headers for the host tests, pytest.
+# CoreTube's: pkg-config and GStreamer/ALSA headers for the host tests, pytest,
+# and 32-bit x86 runtime libraries for V8's build tools (torque and friends are
+# 32-bit x86 programs when V8 targets 32-bit ARM).
 RUN apt-get update && apt-get install -y --no-install-recommends \
       wget bash bc cpio gcc-10 sed patch patchutils tar bzip2 gzip xz-utils zstd perl gawk gperf zip \
       unzip diffutils lzop make file g++-10 xfonts-utils xsltproc default-jre-headless python3 \
       libc6-dev libncurses5-dev libjson-perl libxml-parser-perl libparse-yapp-perl \
       golang-1.22-go git openssh-client rdfind \
       pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libasound2-dev python3-pytest \
+      libc6-i386 lib32gcc-s1 \
  && ln -s /usr/lib/go-1.22 /usr/lib/go \
  && ln -s /usr/lib/go-1.22/bin/go /usr/bin/go \
  && ln -s /usr/lib/go-1.22/bin/gofmt /usr/bin/gofmt \
