@@ -2,6 +2,10 @@
 out/
 work/
 
+# Widevine libraries: never in git (README.md, Widevine)
+drm/runtime/
+coretube-widevine.zip
+
 # Python and tool caches
 __pycache__/
 *.pyc

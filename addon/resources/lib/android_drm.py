@@ -11,8 +11,8 @@ import socket
 import stat
 import struct
 import subprocess
-import tarfile
 import tempfile
+import zipfile
 from http.client import HTTPException
 from pathlib import Path
 
@@ -21,6 +21,20 @@ from android_runtime_bundle import validate_bundle
 
 MAX_PACKET = 1024 * 1024
 CAPACITY = 16 * 1024 * 1024
+# The Widevine libraries do not ship with the add-on: the user copies this zip
+# to the add-on's widevine folder or to one of the shared places.
+RUNTIME_NAME = "coretube-widevine.zip"
+SHARED_PLACES = ("/storage/.config", "/flash", "/storage")
+
+
+def find_runtime(home, shared=SHARED_PLACES):
+    """The Widevine zip in HOME/widevine, else in the first shared place that has it."""
+    own = home / "widevine"
+    own.mkdir(parents=True, exist_ok=True)
+    for folder in (own, *map(Path, shared)):
+        if (folder / RUNTIME_NAME).is_file():
+            return folder / RUNTIME_NAME
+    return None
 
 
 def receive_exact(channel, size):
@@ -83,9 +97,7 @@ def provision(channel):
 
 
 @contextlib.contextmanager
-def runtime(addon, home):
-    archive = addon / "drm" / "runtime-cube-armv7.tar.gz"
-    manifest = validate_bundle(archive)
+def runtime(addon, home, archive, manifest):
     profile = home / "android-drm"
     profile.mkdir(mode=0o700, parents=True, exist_ok=True)
     if profile.is_symlink():
@@ -97,11 +109,11 @@ def runtime(addon, home):
         mounts = []
         try:
             # Validation completes before any member is written.
-            with tarfile.open(archive, "r:gz") as source:
+            with zipfile.ZipFile(archive) as source:
                 for name in manifest:
                     target = root / name
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    with source.extractfile(name) as data, target.open("xb") as output:
+                    with source.open(name) as data, target.open("xb") as output:
                         shutil.copyfileobj(data, output)
                     target.chmod(0o755 if name == "system/bin/linker" else 0o644)
             for name in ("proc", "dev", "tmp", "data"):
@@ -167,6 +179,27 @@ def stop(process):
 
 def run(addon, home, command):
     os.umask(0o077)
+    archive = find_runtime(Path(home))
+    manifest = None
+    if archive is None:
+        print(
+            f"android-drm: no {RUNTIME_NAME} in {Path(home) / 'widevine'} or "
+            f"{', '.join(SHARED_PLACES)}; protected videos will not play",
+            flush=True,
+        )
+    else:
+        try:
+            manifest = validate_bundle(archive)
+            print(f"android-drm: Widevine from {archive}", flush=True)
+        except (OSError, ValueError) as error:
+            print(
+                f"android-drm: {archive} is not usable ({error}); "
+                "protected videos will not play",
+                flush=True,
+            )
+    if manifest is None:
+        # Cobalt plays clear videos without the helper's descriptors.
+        return os.execv(command[0], command)
     stopping = False
 
     def shutdown(_signum, _frame):
@@ -177,7 +210,7 @@ def run(addon, home, command):
         sig: signal.signal(sig, shutdown) for sig in (signal.SIGTERM, signal.SIGINT)
     }
     try:
-        with runtime(Path(addon), Path(home)) as root:
+        with runtime(Path(addon), Path(home), archive, manifest) as root:
             client, helper_channel = socket.socketpair()
             broker, helper_broker = socket.socketpair()
             with (

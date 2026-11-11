@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Collect, write and check the Cube's Android Widevine runtime bundle.
 
-Usage: runtime_bundle.py check ARCHIVE
+Usage: runtime_bundle.py check ZIP   (coretube-widevine.zip)
 Exit 0 when every file matches the manifest and is a library or the linker;
 exit 1 otherwise (for example a provisioned profile or key file).
 """
@@ -12,8 +12,9 @@ import io
 import json
 import pathlib
 import re
+import stat
 import sys
-import tarfile
+import zipfile
 
 # One check for the build and the add-on: the add-on runs the same one on the box.
 sys.path.insert(
@@ -85,16 +86,15 @@ def write_bundle(path, files):
         }
         for name, data in sorted(files.items())
     }
-    with tarfile.open(path, "w:gz") as archive:
-        for name, data in sorted(files.items()):
-            entry = tarfile.TarInfo(name.lstrip("/"))
-            entry.size = len(data)
-            entry.mode = 0o755 if name == "/system/bin/linker" else 0o644
-            archive.addfile(entry, io.BytesIO(data))
-        data = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8")
-        entry = tarfile.TarInfo("runtime-manifest.json")
-        entry.mode, entry.size = 0o644, len(data)
-        archive.addfile(entry, io.BytesIO(data))
+    data = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8")
+    entries = [(name.lstrip("/"), content) for name, content in sorted(files.items())]
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, content in [*entries, ("runtime-manifest.json", data)]:
+            entry = zipfile.ZipInfo(name)
+            mode = 0o755 if name == "system/bin/linker" else 0o644
+            entry.external_attr = (stat.S_IFREG | mode) << 16
+            entry.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(entry, content)
     return manifest
 
 
@@ -104,7 +104,7 @@ def main(argv):
         return 2
     try:
         manifest = validate_bundle(argv[1])
-    except (OSError, ValueError, tarfile.TarError) as error:
+    except (OSError, ValueError) as error:
         print(f"runtime check failed: {error}", file=sys.stderr)
         return 1
     print(f"runtime ok: {len(manifest)} files")

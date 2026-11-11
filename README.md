@@ -7,7 +7,7 @@ CoreTube is a YouTube TV app based on TizenTube, built as a Kodi add-on for Core
 | 32-bit, for example a Fire TV Cube (2nd gen) | 21, Amlogic-ng | `arm` |
 | 64-bit, for example a Xiaomi stick | 22, Amlogic-no | `aarch64` |
 
-Videos play on the box's own video hardware. Protected videos use the official Widevine L3 libraries in `drm/runtime/`. These contain no keys: each box gets its own certificate from Google the first time it plays a protected video.
+Videos play on the box's own video hardware. Protected videos (for example bought or rented films) also need the official Widevine L3 libraries. They are not in this repository or in the add-on zip: they come separately as `coretube-widevine.zip` (see [Widevine](#widevine)). The libraries contain no keys: each box gets its own certificate from Google the first time it plays a protected video.
 
 ## What you need
 
@@ -16,6 +16,8 @@ Videos play on the box's own video hardware. Protected videos use the official W
 - Two folders the build can reuse or fill:
   - a CoreELEC build folder (`--build-dir`). A new one may belong to root: the build then creates CoreELEC's folder inside it for the build user (uid 1000). A folder CoreELEC has already built in must not belong to root;
   - a Cobalt folder (`--cobalt-dir`) for the Cobalt source and its tools.
+
+- `coretube-widevine.zip`, copied to `drm/runtime/` in this repository. The `helper` step links against it. Git ignores that folder.
 
 A first build into empty folders takes several hours. Later builds reuse what is already built. Create the folders first if they do not exist yet.
 
@@ -39,6 +41,17 @@ To install through Kodi and receive updates, add `https://samtheruby.github.io/C
 If you already installed CoreTube from a ZIP, open its add-on information, choose **Versions**, and select CoreTube from **CoreTube Repository** to receive repository updates.
 
 In Kodi, open **Add-ons**, choose **Install from zip file**, and pick the zip. Then open CoreTube from **Add-ons**. Kodi comes back when you exit CoreTube. The add-on keeps its `browser.tizentube` ID so existing installs retain their settings.
+
+### Widevine
+
+Without `coretube-widevine.zip`, CoreTube still starts and plays normal videos, but protected videos do not play. To add it, copy the zip unchanged (do not unpack it) to one of these folders on the box. CoreTube uses the first one it finds, in this order:
+
+1. `/storage/.kodi/userdata/addon_data/browser.tizentube/widevine/` (CoreTube creates this folder the first time it starts)
+2. `/storage/.config/`
+3. `/flash/` (the boot partition; it is read-only while CoreELEC runs, so copy it there from a PC or remount it first)
+4. `/storage/`
+
+You can copy it with Kodi's file manager, over SMB (the `Userdata` and `Configfiles` shares), or with `scp`. CoreTube checks every file in the zip before it uses it. The add-on's `service.log` (in the same `addon_data/browser.tizentube` folder) shows which zip it used, or why it did not use one.
 
 Auto frame rate changes the TV's display mode only for fullscreen videos. Preview cards do not trigger mode changes. Like Kodi, it switches to the video's resolution when Kodi's whitelist has a mode at that resolution and a refresh rate that fits the video. Otherwise it keeps the current resolution and changes only the refresh rate. The video's resolution is the best quality YouTube offers for it. YouTube can offer qualities up to the largest whitelisted resolution, so a 4K video on a TV set to 1080p can switch it to 2160p.
 
@@ -66,4 +79,4 @@ To check the repository locally, download those three release assets into a fold
 
 ## License
 
-CoreTube's own files are under the BSD-3-Clause license (`LICENSE`). Some files keep the license they came with, shown at their top. The Widevine libraries in `drm/runtime/` belong to Google and Amazon.
+CoreTube's own files are under the BSD-3-Clause license (`LICENSE`). Some files keep the license they came with, shown at their top. The Widevine libraries in `coretube-widevine.zip` belong to Google and Amazon and are not part of this repository.

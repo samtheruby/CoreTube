@@ -34,6 +34,8 @@ class AndroidRuntimeTests(unittest.TestCase):
                 else:
                     cobalt.wait.return_value = child_status
                 with (
+                    patch.object(android_drm, "find_runtime", return_value=root),
+                    patch.object(android_drm, "validate_bundle", return_value={}),
                     patch.object(
                         android_drm,
                         "runtime",
@@ -47,6 +49,50 @@ class AndroidRuntimeTests(unittest.TestCase):
                     self.assertEqual(
                         android_drm.run("unused", folder, ["unused"]), expected
                     )
+
+    def test_runtime_zip_lookup_order(self):
+        import android_drm
+
+        self.assertEqual(
+            android_drm.SHARED_PLACES, ("/storage/.config", "/flash", "/storage")
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            home = pathlib.Path(folder) / "addon_data"
+            shared = [
+                pathlib.Path(folder) / name for name in ("config", "flash", "storage")
+            ]
+            for place in shared:
+                place.mkdir()
+            self.assertIsNone(android_drm.find_runtime(home, shared))
+            # The add-on's own folder exists for the user to drop the zip into.
+            self.assertTrue((home / "widevine").is_dir())
+            for place in reversed([home / "widevine", *shared]):
+                (place / "coretube-widevine.zip").touch()
+                self.assertEqual(
+                    android_drm.find_runtime(home, shared),
+                    place / "coretube-widevine.zip",
+                )
+
+    def test_cobalt_starts_without_a_usable_runtime(self):
+        import android_drm
+
+        for found, check in (
+            (None, None),
+            (pathlib.Path("/flash/coretube-widevine.zip"), ValueError("bad zip")),
+        ):
+            with (
+                self.subTest(found=found),
+                patch.object(android_drm, "find_runtime", return_value=found),
+                patch.object(android_drm, "validate_bundle", side_effect=check),
+                patch.object(android_drm, "runtime") as runtime,
+                patch.object(android_drm.os, "umask"),
+                patch.object(android_drm.os, "execv") as execv,
+            ):
+                android_drm.run("addon", "home", ["/addon/cobalt/cobalt", "--flag"])
+                execv.assert_called_once_with(
+                    "/addon/cobalt/cobalt", ["/addon/cobalt/cobalt", "--flag"]
+                )
+                runtime.assert_not_called()
 
     def test_binary_packets_and_truncation(self):
         import android_drm

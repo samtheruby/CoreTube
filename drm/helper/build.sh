@@ -1,23 +1,26 @@
 #!/bin/bash
 # SPDX-License-Identifier: BSD-3-Clause
 # Build the Android Widevine helper (32-bit ARM, Android 9 Bionic) that libocdm
-# talks to. It links the unmodified libraries from the shipped Cube runtime.
+# talks to. It links the unmodified libraries from the Cube's Widevine zip.
 # Usage: TOOLING_DIR=... COBALT_SRC=... drm/helper/build.sh OUT_FILE
 #   TOOLING_DIR: from drm/tools/fetch-tooling.sh
 #   COBALT_SRC:  patched Cobalt src (for the shared android_protocol.h)
+#   RUNTIME:     coretube-widevine.zip (default: drm/runtime/, not in git)
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 out=${1:?usage: drm/helper/build.sh OUT_FILE}
 tooling=${TOOLING_DIR:?set TOOLING_DIR (see drm/tools/fetch-tooling.sh)}
 protocol=${COBALT_SRC:?set COBALT_SRC to the patched Cobalt src}/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/ocdm_widevine
-runtime=${RUNTIME:-$here/../runtime/runtime-cube-armv7.tar.gz}
+runtime=${RUNTIME:-$here/../runtime/coretube-widevine.zip}
 [ -f "$protocol/android_protocol.h" ] || { echo "build.sh: no android_protocol.h in $protocol (Cobalt not patched?)" >&2; exit 1; }
+[ -f "$runtime" ] || { echo "build.sh: no Widevine zip at $runtime (see README.md, Widevine)" >&2; exit 1; }
+python3 -I "$here/../tools/runtime_bundle.py" check "$runtime"
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 # Link against the Cube's own libraries; libc and libdl come from the NDK.
 mkdir "$tmp/stock"
-tar -xzf "$runtime" -C "$tmp" system vendor
+python3 -I -m zipfile -e "$runtime" "$tmp"
 for lib in vendor/lib/libwvhidl.so system/lib/liblog.so \
   system/lib/vndk-28/android.hardware.drm@1.0.so system/lib/vndk-28/android.hardware.drm@1.1.so \
   system/lib/vndk-sp-28/{android.hidl.memory@1.0.so,libbase.so,libc++.so,libcutils.so,libhidlbase.so,libhidltransport.so,libhwbinder.so,libutils.so}; do

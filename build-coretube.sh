@@ -264,9 +264,8 @@ step_helper() {
 }
 
 step_zip() {
-  local runtime=$repo/drm/runtime/runtime-cube-armv7.tar.gz helper=$work_dir/$arch/android-drm-helper
+  local helper=$work_dir/$arch/android-drm-helper
   local install=$ce_build/install_pkg cc=$ce_build/toolchain/bin/$triple-gcc engine f
-  python3 -I "$repo/drm/tools/runtime_bundle.py" check "$runtime"
   engine=$(find_engine)
   [ -n "$engine" ] || die "no Cobalt engine (libcobalt.so) in $src/out (run the cobalt step)"
   for f in "$out/libloader_app.so" "$out/starboard/libocdm.so" "$out/fonts/fonts.xml" "$helper" "$cc"; do
@@ -283,7 +282,7 @@ step_zip() {
   cp "$repo/addon/addon.xml" "$repo/addon/default.py" "$d/"
   cp -r "$repo/addon/resources" "$repo/addon/bin" "$d/"
   find "$d" -type d -name __pycache__ -prune -exec rm -rf -- {} +
-  cp "$runtime" "$helper" "$d/drm/"
+  cp "$helper" "$d/drm/"
   # Our packages install under a private prefix (coretube-gstreamer/coretube.mk).
   local p=usr/lib/coretube
   cp "$install"/coretube-gstreamer-*/$p/libexec/gstreamer-1.0/gst-plugin-scanner "$d/bin/"
@@ -304,10 +303,13 @@ step_zip() {
   cp -r "$engine/app/cobalt/content" "$d/cobalt/app/cobalt/"
   chmod +x "$d"/bin/* "$d/cobalt/cobalt"
 
-  # Never ship DRM state: only the helper and the checked runtime belong in drm/.
+  # Never ship DRM state or the Widevine libraries (users add coretube-widevine.zip
+  # themselves): only the helper belongs in drm/.
   [ -z "$(find "$d" -type d -name android-drm)" ] || die "a DRM profile folder is in the zip stage"
-  [ -z "$(find "$d/drm" -type f ! -name android-drm-helper ! -name runtime-cube-armv7.tar.gz)" ] ||
+  [ -z "$(find "$d/drm" -type f ! -name android-drm-helper)" ] ||
     die "unexpected files in the zip's drm folder: $(ls "$d/drm")"
+  [ -z "$(find "$d" -name 'coretube-widevine.zip' -o -name 'libwvhidl.so' -o -name 'runtime-*.tar.gz')" ] ||
+    die "Widevine libraries are in the zip stage"
 
   mkdir -p "$(dirname "$zip_file")"
   rm -f "$zip_file"

@@ -4,34 +4,43 @@
 import hashlib
 import json
 import re
-import tarfile
+import stat
+import zipfile
 
 
 def validate_bundle(path):
-    with tarfile.open(path, "r:gz") as archive:
-        members = archive.getmembers()
+    """Check coretube-widevine.zip; return its manifest. Raise ValueError if unsafe."""
+    try:
+        archive = zipfile.ZipFile(path)
+    except zipfile.BadZipFile as error:
+        raise ValueError(f"Not a zip file: {error}") from error
+    with archive:
+        # Folder entries are harmless: extraction only writes the manifest's files.
+        members = [member for member in archive.infolist() if not member.is_dir()]
         if (
             not members
             or len(members) > 65
-            or sum(member.size for member in members) > 64 * 1024 * 1024
+            or sum(member.file_size for member in members) > 64 * 1024 * 1024
         ):
             raise ValueError("Invalid runtime bundle size")
         files = {}
         for member in members:
+            kind = stat.S_IFMT(member.external_attr >> 16)
             if (
-                not member.isfile()
-                or member.size < 0
-                or member.size > 32 * 1024 * 1024
-                or any(part in (".", "..") for part in member.name.split("/"))
-                or member.name in files
+                kind not in (0, stat.S_IFREG)
+                or member.file_size > 32 * 1024 * 1024
+                or member.filename in files
                 or not re.fullmatch(
                     # Libraries only: a profile or key file never belongs here.
                     r"runtime-manifest\.json|system/bin/linker|(?:system|vendor)/lib/(?:vndk(?:-sp)?-28/)?[A-Za-z0-9_@.+-]+\.so",
-                    member.name,
+                    member.filename,
                 )
             ):
                 raise ValueError("Unsafe runtime archive member")
-            files[member.name] = archive.extractfile(member).read()
+            try:
+                files[member.filename] = archive.read(member)
+            except zipfile.BadZipFile as error:
+                raise ValueError(f"Damaged runtime zip: {error}") from error
         if "runtime-manifest.json" not in files:
             raise ValueError("Missing runtime manifest")
         manifest = json.loads(files.pop("runtime-manifest.json"))

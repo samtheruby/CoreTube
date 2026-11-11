@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from unittest import mock
 
 tools = pathlib.Path(__file__).resolve().parents[1]
@@ -13,7 +14,8 @@ sys.path.insert(0, str(tools))
 import runtime_bundle
 from runtime_bundle import collect_runtime, write_bundle
 
-shipped = tools.parent / "runtime" / "runtime-cube-armv7.tar.gz"
+# Not in git: the Widevine zip is copied here by hand for builds (see README).
+local_runtime = tools.parent / "runtime" / "coretube-widevine.zip"
 
 
 def check(path):
@@ -67,19 +69,27 @@ class CollectTests(unittest.TestCase):
 
 
 class CheckTests(unittest.TestCase):
-    def test_shipped_runtime_passes(self):
-        result = check(shipped)
+    @unittest.skipUnless(local_runtime.is_file(), "no local coretube-widevine.zip")
+    def test_local_runtime_passes(self):
+        result = check(local_runtime)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("21 files", result.stdout)
 
     def test_written_bundle_passes_and_profile_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
-            good = pathlib.Path(temporary) / "good.tar.gz"
+            good = pathlib.Path(temporary) / "good.zip"
             write_bundle(
                 good, {"/system/bin/linker": b"l", "/vendor/lib/libwvhidl.so": b"w"}
             )
             self.assertEqual(check(good).returncode, 0)
-            bad = pathlib.Path(temporary) / "bad.tar.gz"
+            with zipfile.ZipFile(good) as archive:
+                self.assertEqual(
+                    archive.getinfo("system/bin/linker").external_attr >> 16, 0o100755
+                )
+            self.assertEqual(
+                check(pathlib.Path(temporary) / "missing.zip").returncode, 1
+            )
+            bad = pathlib.Path(temporary) / "bad.zip"
             write_bundle(
                 bad,
                 {

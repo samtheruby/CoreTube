@@ -26,7 +26,7 @@ def main():
         "--helper", required=True, type=pathlib.Path, help="built android-drm-helper"
     )
     parser.add_argument(
-        "--output", type=pathlib.Path, default=pathlib.Path("runtime-cube-armv7.tar.gz")
+        "--output", type=pathlib.Path, default=pathlib.Path("coretube-widevine.zip")
     )
     args = parser.parse_args()
     client = paramiko.SSHClient()
