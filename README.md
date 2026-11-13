@@ -57,6 +57,8 @@ Auto frame rate changes the TV's display mode only for fullscreen videos. Previe
 
 When you leave a video with back, the TV goes back to its own display mode at once, like Kodi when playback stops. The picture stays off until the switch is done, then the menu shows. When a video ends and the next one starts, the mode stays for 5 seconds, so a next video at the same rate needs no switch.
 
+The TV's remote works in CoreTube over HDMI-CEC, as in Kodi: the arrows, OK, Back (or Exit/Return) and the play, pause, stop, next and previous buttons. It follows Kodi's CEC settings (**Settings** > **System** > **Input** > **Peripherals** > **CEC adapter**): when CEC is off there, CoreTube does not use it either. Play and pause each toggle playback. The add-on's `service.log` shows whether the remote is on.
+
 CoreTube tells YouTube it is a Fire TV Cube, because YouTube buffers much better for it. To send Cobalt's own user agent instead, put `export TIZENTUBE_USER_AGENT=''` in the add-on's `env` file (in Kodi's `userdata/addon_data/browser.tizentube` folder).
 
 After a display mode switch, the video waits before it plays, as in Kodi. The wait is Kodi's **Delay after change of refresh rate** (**Settings** > **System** > **Display**), and at least 1 second, while the TV's picture is off for the switch. TizenTube's own **Auto frame rate pause duration** option has no effect.

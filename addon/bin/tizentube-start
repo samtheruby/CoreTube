@@ -49,6 +49,8 @@ fi
 kodi_setting() {
   sed -n "s|.*<setting id=\"$1\"[^>]*>\([^<]*\)<.*|\1|p" "${HOME}/.kodi/userdata/guisettings.xml" 2>/dev/null
 }
+# The TV remote over HDMI-CEC follows Kodi's CEC adapter settings.
+kodi_cec_settings="${HOME}/.kodi/userdata/peripheral_data/cec_CEC_Adapter.xml"
 export TIZENTUBE_PASSTHROUGH=""
 export TIZENTUBE_PASSTHROUGH_DEVICE=""
 case "$(kodi_setting audiooutput.passthroughdevice)" in
@@ -131,6 +133,8 @@ export HOME="${ADDON_HOME}"
   echo "user agent: ${TIZENTUBE_USER_AGENT:-Cobalt default}"
   echo "playback waits after a display mode switch: ${TIZENTUBE_SWITCH_DELAY_MS:-0} ms (Kodi's delay; at least 1 s)"
   echo "passthrough: ${TIZENTUBE_PASSTHROUGH:-off}${TIZENTUBE_PASSTHROUGH:+ to ${TIZENTUBE_PASSTHROUGH_DEVICE}}"
+  # Kodi has let go of CEC; the remote's keyboard must exist before Cobalt starts.
+  python3 "${ADDON_DIR}/bin/cec-remote.py" "${kodi_cec_settings}"
   # The user agent holds spaces and ';', so it goes over as one argument.
   export ADDON_DIR
   exec python3 "${ADDON_DIR}/bin/android-drm-run.py" "${ADDON_DIR}/cobalt/cobalt" --evergreen_lite \
