@@ -1,0 +1,194 @@
+From c61493eb0ead954ad831b3f2cefcf16f84a67dce Mon Sep 17 00:00:00 2001
+From: samtheruby <peasea1012@gmail.com>
+Date: Fri, 13 Nov 2026 01:31:02 +0000
+Subject: [PATCH] feat(coreelec): back to the menu's display mode as soon as
+ back is pressed
+
+After a video, auto frame rate kept the video's mode for 5 seconds before
+going back, so the next video at the same rate needs no switch. Leaving
+with back then showed the menu in the video's mode, and the TV blanked
+for the switch only seconds later.
+
+Now a back press (Escape or Browser Back) tells auto frame rate first.
+When the full-screen video goes within 2 seconds of it, the display goes
+back at once, as Kodi does on stop: HDMI is muted before the switch and
+stays muted until the new mode settles, so the menu shows only in its
+own mode. A back press with a return pending makes it now. A back press
+that only hides the player's controls leaves the video, so nothing
+changes, and autoplay's next video keeps the 5 second hold.
+---
+ .../coreelec/tests/coreelec_display_test.cc   | 33 +++++++++++++++++++
+ .../starboard/rdk/shared/coreelec_display.cc  | 26 +++++++++++++--
+ .../starboard/rdk/shared/coreelec_display.h   | 16 ++++++++-
+ starboard/shared/linux/dev_input/dev_input.cc | 10 ++++++
+ 4 files changed, 82 insertions(+), 3 deletions(-)
+
+diff --git a/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/tests/coreelec_display_test.cc b/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/tests/coreelec_display_test.cc
+index 85833b8edd3..45cb2d0efa3 100644
+--- a/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/tests/coreelec_display_test.cc
++++ b/starboard/contrib/rdk/src/third_party/starboard/rdk/coreelec/tests/coreelec_display_test.cc
+@@ -189,6 +189,39 @@ int main() {
+   s = watch.Restore("1080p24hz", false, t0 + 30s + delay);
+   assert(s && s->name == "1080p60hz");
+ 
++  // Back leaves the video: when the full-screen video goes soon after the press,
++  // the display goes back at once (as Kodi does on stop), not kRestoreDelay later.
++  const auto window = AutoFrameRate::kBackWindow;
++  AutoFrameRate back;
++  back.BackPressed(t0);                                             // nothing to undo
++  assert(!back.restore_time());
++  back.SetVideosOnScreen(1, t0);
++  s = back.Choose(modes, "1080p60hz", false, caps, 24, t0);
++  assert(s && s->name == "1080p24hz");
++  back.BackPressed(t0 + 10s);
++  assert(!back.restore_time());                                     // the video still shows
++  back.SetVideosOnScreen(0, t0 + 10s + 100ms);
++  assert(back.restore_time() == t0 + 10s + 100ms);
++  s = back.Restore("1080p24hz", false, t0 + 10s + 100ms);
++  assert(s && s->name == "1080p60hz");
++  // Back that only hides the player's controls: the video stays, and when it goes
++  // later (autoplay's next player) the delay holds again.
++  back.SetVideosOnScreen(1, t0 + 20s);
++  back.Choose(modes, "1080p60hz", false, caps, 24, t0 + 20s);
++  back.BackPressed(t0 + 21s);
++  back.SetVideosOnScreen(0, t0 + 21s + window + 1s);
++  assert(back.restore_time() == t0 + 21s + window + 1s + delay);
++  // Back while that return waits: it happens now.
++  back.BackPressed(t0 + 25s);
++  assert(back.restore_time() == t0 + 25s);
++  s = back.Restore("1080p24hz", false, t0 + 25s);
++  assert(s && s->name == "1080p60hz");
++  // A press long ago does not count for a later video.
++  back.SetVideosOnScreen(1, t0 + 40s);
++  back.Choose(modes, "1080p60hz", false, caps, 24, t0 + 40s);
++  back.SetVideosOnScreen(0, t0 + 41s);
++  assert(back.restore_time() == t0 + 41s + delay);
++
+   // A resolution switch goes back to the resolution from before; the height is
+   // replayed with the rate when fullscreen bounds arrive later.
+   AutoFrameRate sized;
+diff --git a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.cc b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.cc
+index 8c371774d33..139b4a173ba 100644
+--- a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.cc
++++ b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.cc
+@@ -555,8 +555,23 @@ void AutoFrameRate::SetVideosOnScreen(int count, Clock::time_point now) {
+   videos_on_screen_ = count;
+   if (count > 0) {
+     restore_at_.reset();
+-  } else if (was_on_screen && original_ && !restore_at_) {
+-    restore_at_ = now + kRestoreDelay;
++    return;
++  }
++  if (was_on_screen && original_ && !restore_at_) {
++    const bool leaving = back_until_ && now <= *back_until_;
++    restore_at_ = leaving ? now : now + kRestoreDelay;
++  }
++  back_until_.reset();
++}
++
++void AutoFrameRate::BackPressed(Clock::time_point now) {
++  if (!original_) {
++    return;
++  }
++  if (restore_at_) {
++    restore_at_ = std::min(*restore_at_, now);
++  } else if (videos_on_screen_ > 0) {
++    back_until_ = now + kBackWindow;
+   }
+ }
+ 
+@@ -595,6 +610,13 @@ void SetVideoOnScreen(bool on_screen) {
+   g_frame_rate_wake.notify_all();
+ }
+ 
++void BackPressed() {
++  std::lock_guard<std::mutex> lock(g_frame_rate_mutex);
++  g_frame_rate.BackPressed(AutoFrameRate::Clock::now());
++  // A return now due is made by the thread, which waits for the old time.
++  g_frame_rate_wake.notify_all();
++}
++
+ void SetModeSetter(ModeSetter setter) {
+   std::lock_guard<std::mutex> lock(g_setter_mutex);
+   g_setter = std::move(setter);
+diff --git a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.h b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.h
+index 0bb5ea17bce..b046d0818cd 100644
+--- a/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.h
++++ b/starboard/contrib/rdk/src/third_party/starboard/rdk/shared/coreelec_display.h
+@@ -88,6 +88,9 @@ class AutoFrameRate {
+   // How long the display keeps a video's rate once no video wants one: the next
+   // video usually wants the same rate, and each switch blanks the TV.
+   static constexpr std::chrono::seconds kRestoreDelay{5};
++  // Back leaves the watch page: a full-screen video that goes within this long
++  // after a back press takes the display back at once, as Kodi does on stop.
++  static constexpr std::chrono::seconds kBackWindow{2};
+ 
+   // The switch for |frame_rate| (see ChooseModeSwitch), only while a video
+   // fills the screen; only then does it cancel a pending return. A |frame_rate|
+@@ -112,9 +115,16 @@ class AutoFrameRate {
+ 
+   // How many full-screen videos are on screen. Each keeps the display's rate (as
+   // a video surface does on Android): it cancels a pending return, and when the
+-  // last one goes, the return is due kRestoreDelay after |now|.
++  // last one goes, the return is due kRestoreDelay after |now|, or at |now|
++  // within kBackWindow of a back press.
+   void SetVideosOnScreen(int count, Clock::time_point now);
+ 
++  // The user pressed back at |now|. A pending return is due at once; with a
++  // full-screen video on screen, the return comes as soon as it goes (a back
++  // press that only hides the player's controls leaves the video, and nothing
++  // changes).
++  void BackPressed(Clock::time_point now);
++
+   // When the return is due; empty when none is pending.
+   std::optional<Clock::time_point> restore_time() const { return restore_at_; }
+ 
+@@ -127,6 +137,7 @@ class AutoFrameRate {
+  private:
+   std::optional<ModeSwitch> original_;
+   std::optional<Clock::time_point> restore_at_;
++  std::optional<Clock::time_point> back_until_;
+   int videos_on_screen_ = 0;
+   double frame_rate_ = 0;
+   int video_height_ = 0;
+@@ -139,6 +150,9 @@ void ResetFrameRate();
+ // A player's video started (true) or stopped (false) filling the screen.
+ void SetVideoOnScreen(bool on_screen);
+ 
++// The remote's back key was pressed (AutoFrameRate::BackPressed).
++void BackPressed();
++
+ // Whether a video at these bounds covers a |window_width|x|window_height| window.
+ bool CoversWindow(int x, int y, int width, int height, int window_width, int window_height);
+ 
+diff --git a/starboard/shared/linux/dev_input/dev_input.cc b/starboard/shared/linux/dev_input/dev_input.cc
+index ee418991d9c..45c70060a0f 100644
+--- a/starboard/shared/linux/dev_input/dev_input.cc
++++ b/starboard/shared/linux/dev_input/dev_input.cc
+@@ -42,6 +42,9 @@
+ #include "starboard/input.h"
+ #include "starboard/key.h"
+ #include "starboard/shared/posix/handle_eintr.h"
++#if defined(COREELEC)
++#include "third_party/starboard/rdk/shared/coreelec_display.h"
++#endif
+ 
+ namespace starboard {
+ namespace {
+@@ -1279,6 +1282,13 @@ DevInput::Event* DevInputImpl::KeyInputToApplicationEvent(
+   data->key = key;
+   data->key_location = KeyCodeToSbKeyLocation(event.code);
+   data->key_modifiers = modifiers;
++#if defined(COREELEC)
++  // Before the page sees it: auto frame rate goes back to the menu's mode as
++  // soon as back takes the video away (1 is a press, 2 its auto-repeat).
++  if (event.value == 1 && (key == kSbKeyEscape || key == kSbKeyBrowserBack)) {
++    ::third_party::starboard::rdk::shared::coreelec::BackPressed();
++  }
++#endif
+   return new Event(kSbEventTypeInput, data,
+                    &Application::DeleteDestructor<SbInputData>);
+ }
+-- 
+2.47.3
+

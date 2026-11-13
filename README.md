@@ -55,6 +55,8 @@ You can copy it with Kodi's file manager, over SMB (the `Userdata` and `Configfi
 
 Auto frame rate changes the TV's display mode only for fullscreen videos. Preview cards do not trigger mode changes. Like Kodi, it switches to the video's resolution when Kodi's whitelist has a mode at that resolution and a refresh rate that fits the video. Otherwise it keeps the current resolution and changes only the refresh rate. The video's resolution is the best quality YouTube offers for it. YouTube can offer qualities up to the largest whitelisted resolution, so a 4K video on a TV set to 1080p can switch it to 2160p.
 
+When you leave a video with back, the TV goes back to its own display mode at once, like Kodi when playback stops. The picture stays off until the switch is done, then the menu shows. When a video ends and the next one starts, the mode stays for 5 seconds, so a next video at the same rate needs no switch.
+
 CoreTube tells YouTube it is a Fire TV Cube, because YouTube buffers much better for it. To send Cobalt's own user agent instead, put `export TIZENTUBE_USER_AGENT=''` in the add-on's `env` file (in Kodi's `userdata/addon_data/browser.tizentube` folder).
 
 After a display mode switch, the video waits before it plays, as in Kodi. The wait is Kodi's **Delay after change of refresh rate** (**Settings** > **System** > **Display**), and at least 1 second, while the TV's picture is off for the switch. TizenTube's own **Auto frame rate pause duration** option has no effect.
